@@ -165,8 +165,16 @@ async function scrollAll(w, maxRounds = 120) {
       const atBottom = await w.page.evaluate(
         () => window.innerHeight + window.scrollY >= document.body.scrollHeight - 100
       )
-      if (atBottom) break
-      stall = Math.floor(stall / 2) // 不在底部 → 减半计数继续滚动
+      if (atBottom) {
+        // 慢出口（WARP/跨境）在途批次兜底：到底后长停顿 6~12s 再数一次，
+        // 有新增则计数清零继续（大列表类型实测 1318↔450 波动即此因——批次延迟超 stall 窗口被误判完成）
+        await w.jitter(6, 12)
+        const recheck = await countCards(w)
+        if (recheck === now) break // 确认真无新增
+        stall = 0
+      } else {
+        stall = Math.floor(stall / 2) // 不在底部 → 减半计数继续滚动
+      }
     }
   }
   // 平滑回到顶部（类型切换控件在页首；浏览完回看顶部也更像真人）
