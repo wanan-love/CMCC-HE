@@ -75,7 +75,7 @@ jobs:
           warp-cli --accept-tos connect >/dev/null 2>&1 || warp-cli connect
           for i in $(seq 1 20); do
             if warp-cli --accept-tos status 2>/dev/null | grep -q '^Status update: Connected'; then
-              if curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace/ | grep -Eq '^warp=(on|plus)'; then
+              if curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace | grep -Eq '^warp=(on|plus)'; then
                 warp_mode=tun; break
               fi
             fi
@@ -93,7 +93,7 @@ jobs:
               --sysctl net.ipv4.conf.all.src_valid_mark=1 \
               caomingjun/warp >/dev/null 2>&1 || true
             for i in $(seq 1 100); do
-              if curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace/ | grep -Eq '^warp=(on|plus)'; then
+              if curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -Eq '^warp=(on|plus)'; then
                 warp_mode=docker-proxy
                 echo "WARP_SOCKS=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
                 break
@@ -113,7 +113,7 @@ jobs:
             *)
               # 诊断信息（便于判断是网络问题还是环境问题）
               echo "── WARP 诊断信息："
-              curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace/ | head -5 || true
+              curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace | head -5 || true
               journalctl -u warp-svc --no-pager -n 8 2>/dev/null || true
               docker logs warp-docker --tail 8 2>/dev/null || true
               if [ "$WARP_REQUIRED" = "true" ]; then
@@ -127,9 +127,9 @@ jobs:
 
           echo "出口信息（ip/warp/loc/colo）："
           case "$warp_mode" in
-            tun)          curl -s https://www.cloudflare.com/cdn-cgi/trace/ | grep -E '^(ip|warp|loc|colo)=' || true ;;
-            docker-proxy) curl -s --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace/ | grep -E '^(ip|warp|loc|colo)=' || true ;;
-            direct)       curl -s https://www.cloudflare.com/cdn-cgi/trace/ | grep -E '^(ip|warp|loc|colo)=' || true ;;
+            tun)          curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc|colo)=' || true ;;
+            docker-proxy) curl -s --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc|colo)=' || true ;;
+            direct)       curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc|colo)=' || true ;;
           esac
 
       # ---------- 抓取（WARP 出口 + 真人节奏 · 多 worker 并行） ----------
