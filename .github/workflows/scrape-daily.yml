@@ -1,0 +1,174 @@
+# 每日资费抓取 → 归一化 → 加密推送（Cloudflare Workers 做不了浏览器渲染抓取，故用 GitHub Actions）
+#
+# 触发：每日 UTC 20:00（北京时间 04:00）+ 手动 workflow_dispatch
+# 采集出口（三级尝试）：
+#   1. warp-cli TUN 模式（60s 快试；GitHub runner 实测数据面大概率不通，仅环境兜底）
+#   2. docker 容器化 WARP（caomingjun/warp，socks5://127.0.0.1:1080）——runner 上实测唯一稳定路径
+#   3. 直连兜底（公示页为公开信息页；仓库变量 WARP_REQUIRED=true 可改严格模式=宁可中止不裸抓）
+# 采集节奏：scrape.mjs 真人节奏（随机抖动 + 小步浏览/直跳底部触发懒加载 + 阅读停顿）
+# 依赖 Secrets：
+#   SYNC_API_URL  线上同步接口完整地址，如 https://your-site.pages.dev/api/sync
+#   SYNC_TOKEN    与线上环境变量 SYNC_TOKEN 一致的密钥（openssl rand -hex 32 生成）
+# 可选变量（Settings → Secrets and variables → Actions → Variables）：
+#   WARP_REQUIRED = true 时 WARP 全失败则中止当日抓取（严格模式）
+#
+# 详见 docs/DEPLOY-CLOUDFLARE.md
+
+name: Daily Tariff Scrape & Sync
+
+on:
+  schedule:
+    - cron: '0 20 * * *' # UTC 20:00 = 北京时间次日 04:00（避开公示页白天访问高峰）
+  workflow_dispatch: {}
+
+# 同一时刻只跑一个实例，防止重复推送产生重复对比
+concurrency:
+  group: daily-scrape
+  cancel-in-progress: false
+
+env:
+  WARP_REQUIRED: ${{ vars.WARP_REQUIRED }}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # 真人节奏（随机间隔）拉长了整体耗时，预留充裕超时
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright & Chromium
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+
+      # ---------- WARP 网络出口 ----------
+      - name: Install Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloudflare-warp
+          # 启动后台服务（deb 安装通常已自启，显式兜底）
+          sudo systemctl enable --now warp-svc 2>/dev/null || sudo systemctl start warp-svc 2>/dev/null || true
+          sleep 3
+          warp-cli --version
+
+      - name: Connect WARP（TUN 快试 → docker 容器化 → 直连兜底）
+        run: |
+          set -x
+          # 匿名注册（新版 registration new，兼容旧版 register；重复注册幂等）
+          warp-cli --accept-tos registration new 2>/dev/null \
+            || warp-cli register 2>/dev/null || true
+          sleep 2
+
+          warp_mode=""   # tun | docker-proxy | direct
+
+          # ── 尝试 1：warp-cli TUN 模式（60s 快试；GitHub runner 上大概率数据面不通，仅作环境兜底）
+          echo "── 尝试 1/2: warp-cli TUN…"
+          warp-cli --accept-tos connect >/dev/null 2>&1 || warp-cli connect
+          for i in $(seq 1 20); do
+            if warp-cli --accept-tos status 2>/dev/null | grep -q '^Status update: Connected'; then
+              if curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace/ | grep -Eq '^warp=(on|plus)'; then
+                warp_mode=tun; break
+              fi
+            fi
+            sleep 3
+          done
+          [ -z "$warp_mode" ] && warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+
+          # ── 尝试 2：docker 容器化 WARP（caomingjun/warp：容器独立 netns 自管 TUN + gost socks5；
+          #    实测 runner 上唯一稳定的 WARP 路径。镜像拉取+注册+MASQUE 握手约需 2~4 分钟，等足 5 分钟）
+          if [ -z "$warp_mode" ]; then
+            echo "── 尝试 2/2: docker 容器化 WARP（socks5://127.0.0.1:1080）…"
+            docker run -d --name warp-docker -p 127.0.0.1:1080:1080 \
+              --restart unless-stopped --cap-add NET_ADMIN \
+              --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+              --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+              caomingjun/warp >/dev/null 2>&1 || true
+            for i in $(seq 1 100); do
+              if curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace/ | grep -Eq '^warp=(on|plus)'; then
+                warp_mode=docker-proxy
+                echo "WARP_SOCKS=socks5://127.0.0.1:1080" >> "$GITHUB_ENV"
+                break
+              fi
+              sleep 3
+            done
+          fi
+
+          # ── 结果汇报
+          case "$warp_mode" in
+            tun)
+              echo "✅ WARP TUN 模式已连接，runner 全机流量走 WARP 出口"
+              ;;
+            docker-proxy)
+              echo "✅ WARP docker 代理已连接（socks5://127.0.0.1:1080），Chromium 走代理抓取（推送 API 走直连）"
+              ;;
+            *)
+              # 诊断信息（便于判断是网络问题还是环境问题）
+              echo "── WARP 诊断信息："
+              curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace/ | head -5 || true
+              journalctl -u warp-svc --no-pager -n 8 2>/dev/null || true
+              docker logs warp-docker --tail 8 2>/dev/null || true
+              if [ "$WARP_REQUIRED" = "true" ]; then
+                echo "::error::WARP 全部失败且 WARP_REQUIRED=true（严格模式），本次抓取中止"
+                exit 1
+              fi
+              warp_mode=direct
+              echo "::warning::WARP 全部失败——以 runner 直连兜底继续抓取（公示页为公开信息页；可在仓库变量设 WARP_REQUIRED=true 启用严格模式）"
+              ;;
+          esac
+
+          echo "出口信息（ip/warp/loc/colo）："
+          case "$warp_mode" in
+            tun)          curl -s https://www.cloudflare.com/cdn-cgi/trace/ | grep -E '^(ip|warp|loc|colo)=' || true ;;
+            docker-proxy) curl -s --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace/ | grep -E '^(ip|warp|loc|colo)=' || true ;;
+            direct)       curl -s https://www.cloudflare.com/cdn-cgi/trace/ | grep -E '^(ip|warp|loc|colo)=' || true ;;
+          esac
+
+      # ---------- 抓取（WARP 出口 + 真人节奏 · 多 worker 并行） ----------
+      - name: Scrape 公示页（河北 · 个人/政企 × 全网/河北，2 worker 并行 + 真人节奏）
+        env:
+          # 并行 worker 数（1~4）：每个 worker 独立 context/指纹/节奏，同一 WARP 出口后的多个"虚拟用户"
+          # 2 = 全量约 10~15 分钟（串行版 20~30）；调 4 约 6~8 分钟但 runner CPU 压力增大
+          SCRAPE_CONCURRENCY: '2'
+        run: node scripts/scrape.mjs
+
+      - name: Normalize 归一化
+        run: node scripts/normalize.mjs
+
+      - name: Sanity check（空结果 / 数量骤降直接失败，不推送）
+        run: |
+          node -e "
+            const items = require('./seed/tariffs.normalized.json');
+            if (!Array.isArray(items) || items.length === 0) { console.error('抓取结果为空'); process.exit(1); }
+            if (items.length < 200) { console.error('抓取数量异常偏少: ' + items.length + '（公示页可能改版，需人工检查选择器）'); process.exit(1); }
+            console.log('sanity ok: ' + items.length + ' items');
+          "
+
+      - name: Push 到线上同步 API（Bearer 加密，失败自动重试 3 次）
+        env:
+          SYNC_API_URL: ${{ secrets.SYNC_API_URL }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: node scripts/push-sync.mjs
+
+      # 每日快照归档（免费 artifact 保留 90 天，作为数据备份/审计线索）
+      - name: Upload snapshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tariffs-${{ github.run_number }}
+          path: seed/tariffs.normalized.json
+          retention-days: 90
+
+      # ---------- 清理 ----------
+      - name: Disconnect WARP（清理）
+        if: always()
+        run: |
+          warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+          docker rm -f warp-docker >/dev/null 2>&1 || true

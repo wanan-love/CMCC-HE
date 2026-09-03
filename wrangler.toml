@@ -1,0 +1,11 @@
+# Cloudflare Pages 部署配置（wrangler pages deploy 读取）
+# 前端：静态导出（scripts/build-pages.sh → pages-out/）
+# 后端：functions/api/[[path]].ts（Pages Functions + D1 binding）
+name = "cmcc-he"
+compatibility_date = "2026-09-01"
+pages_build_output_dir = "pages-out"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cmcc-he-db"
+database_id = "2726a0e1-841b-4c50-9a8a-f8da2fedbcb8"

@@ -1,0 +1,87 @@
+// 中国移动资费时间轴数据库
+// Tariff: 当前资费状态 / SyncRun: 同步运行记录 / ChangeEvent: 每日变更事件
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// 资费表：当前在售（或已下线）资费的最新状态
+model Tariff {
+  id          String   @id @default(cuid())
+  code        String   @unique // 方案编号，唯一标识
+  name        String // 资费名称
+  category    String // 套餐 / 加装包 / 营销活动 / 港澳台国际
+  scope       String // 个人 / 政企
+  range       String // 全网 / 河北
+  province    String // 河北
+  price       String? // 资费标准原文，如 199元/月
+  priceValue  Float? // 数值化价格（元/月）
+  onlineDate  String? // 上线日期 YYYY-MM-DD
+  offlineDate String? // 下线日期 YYYY-MM-DD
+  target      String? // 适用范围
+  channels    String? // 销售渠道
+  effective   String? // 有效期限
+  requirement String? // 在网要求
+  unsubscribe String? // 退订方式
+  liability   String? // 违约责任
+  usageJson   String // 套餐内容 JSON [{label,value}]
+  extraJson   String // 其他说明 JSON {超出资费说明,其他服务内容,其他说明}
+  contentHash String // 内容哈希，用于变更检测
+  firstSeenAt DateTime // 首次发现（历史重构=上线日期）
+  lastSeenAt  DateTime // 最后确认在线
+  status      String // ONLINE / OFFLINE
+  removedAt   DateTime? // 标记下线时间
+
+  events ChangeEvent[]
+
+  @@index([category])
+  @@index([status])
+  @@index([onlineDate])
+  @@index([offlineDate])
+}
+
+// 同步运行记录：每次抓取对比一次
+model SyncRun {
+  id          String    @id @default(cuid())
+  startedAt   DateTime  @default(now())
+  finishedAt  DateTime?
+  date        String // 快照日期 YYYY-MM-DD
+  status      String // RUNNING / SUCCESS / FAILED
+  source      String // scraper / seed-import / demo
+  mode        String // full / incremental
+  totalBefore Int       @default(0)
+  totalAfter  Int       @default(0)
+  added       Int       @default(0)
+  removed     Int       @default(0)
+  updated     Int       @default(0)
+  message     String?
+  undoJson    String? // 演示同步的回滚快照 JSON（支持一键撤销）
+  undoneAt    DateTime? // 已撤销时间
+}
+
+// 变更事件：时间轴数据源
+model ChangeEvent {
+  id            String   @id @default(cuid())
+  date          String // 事件日期 YYYY-MM-DD（时间轴刻度）
+  type          String // ADDED / REMOVED / UPDATED
+  source        String // history(上线日期重构) / sync(同步对比) / demo(演示)
+  tariffCode    String?
+  tariffName    String
+  category      String?
+  changedFields String? // JSON: [{field, before, after}]
+  summary       String? // 一句话摘要
+  syncRunId     String?
+  createdAt     DateTime @default(now())
+
+  tariff Tariff? @relation(fields: [tariffCode], references: [code], onDelete: SetNull)
+
+  @@index([date])
+  @@index([type])
+  @@index([tariffCode])
+  @@index([source])
+}

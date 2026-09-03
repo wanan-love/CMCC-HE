@@ -1,0 +1,232 @@
+# 部署方案：Cloudflare Pages + D1 + GitHub Actions 每日抓取
+
+> 本文档回答三个核心问题：**为什么抓取放 GitHub Actions、同步接口如何加密、D1 容量与读写费用是否可控**，并给出完整落地步骤。
+
+## 一、架构总览
+
+```
+┌─────────────────┐   每日 04:00（北京）    ┌──────────────────────────┐
+│  GitHub Actions │ ──────────────────────► │  Cloudflare Pages 站点    │
+│  Playwright     │   POST /api/sync        │  ├─ 前端（Next.js SSR）   │
+│  抓取公示页      │   Authorization:        │  ├─ API Functions        │
+│  → 归一化        │   Bearer <SYNC_TOKEN>   │  │   └─ 差异对比引擎      │
+└─────────────────┘                          │  └─ D1（SQLite 数据库）  │
+                                             └──────────────────────────┘
+```
+
+**为什么抓取用 GitHub Actions 而不是 Workers Cron：**
+- 移动公示页是 Vue SPA，资费列表靠 JS 动态渲染，且请求体加密（API 直连不可行）——必须跑真实浏览器（Playwright Chromium）；
+- Cloudflare Workers 无法运行无头浏览器（浏览器渲染协议在 Workers 中不可用），且 CPU 时间限额（免费 10ms / 付费 5min）远不够渲染 3000+ 卡片；
+- GitHub Actions 的 ubuntu-latest runner 免费提供 Chromium 环境，`cron` 定时 + artifact 备份 + 失败重试，全部免费。
+- 每日快照归档为 Actions artifact（保留 90 天），同时是数据备份与审计线索。
+
+## 二、后端存储：现在是什么？D1 够不够？
+
+**现状（沙箱）**：SQLite 单文件（Prisma ORM），`db/custom.db` 当前 **5.82 MB**。
+
+**生产方案**：Cloudflare **D1**（就是托管版 SQLite），三张表结构不变：
+
+| 表 | 当前行数 | 平均行大小 | 当前体积 |
+|---|---|---|---|
+| Tariff（资费当前态） | 3,109 | ~775 B | ≈ 2.4 MB |
+| ChangeEvent（变更事件） | 3,109 | ~292 B | ≈ 0.9 MB |
+| SyncRun（同步记录） | 17 | ~200 B | 忽略 |
+| 索引等 | — | — | 全库 5.82 MB |
+
+**容量估算（0.5 GB 上限内吗？——完全够）：**
+
+| 增长项 | 速率 | 5 年后 |
+|---|---|---|
+| Tariff（新资费累积，下线行保留） | ~5-10 行/天 × 775B | ≈ +10-14 MB |
+| ChangeEvent（真实变更，公示页日变更通常 0~50 条，按 20 条/天均值） | 7,300 行/年 × 292B | ≈ +10.7 MB |
+| SyncRun（每日 1 行） | 365 行/年 | ≈ +0.4 MB |
+| **合计** | | **≈ 30-35 MB ＜ 0.5 GB（1/15）** |
+
+即使公示页改版导致一次性大重构（如全量 3,109 条事件重灌一次），也只 +0.9 MB。**结论：D1 免费层 5 GB 总量 / 0.5 GB 单库上限完全够用，可用十年以上。**
+
+## 三、D1 读写费用优化（计费 = 按行数，行内容大小不计费）
+
+D1 免费层：**每天 500 万行读 / 10 万行写**。本项目设计天然契合"行少内容多"：
+
+1. **「无变化不写」**（已实现于 `/api/sync` 差异引擎）：
+   抓取 3,109 条中未变化的资费**不再逐行刷新 `lastSeenAt`**（旧行为每天白写 3,100+ 行）；
+   `lastSeenAt` 语义收敛为「内容最后一次确认」。每日真实写入 = 变更行（0~50）+ 1 行 SyncRun。
+   → **每天写入 ≈ 50 行，占用免费额度 0.05%**。
+
+2. **批量提交**（已实现）：新增资费 / 事件 `createMany` 按 500 条/事务攒批，下线检测用 `updateMany`，单次网络往返。
+
+3. **行内容可以多**（schema 天然如此）：套餐内容（`usageJson`）、其他说明（`extraJson`）整段 JSON 存单行单列——D1 按行计费、不按字节计费，**这正是"每行内容多、行数少"的最优形态**。
+
+4. **读路径全部走索引 + 分页**：
+   - 每日 diff 全表读一次 ≈ 3,109 行（免费额度 0.06%/天）；
+   - 页面查询：timeline `groupBy(date,type)` + 每页 12 天 × 60 条明细、资费库 12 条/页 + count、upcoming 最多 1,000 行——单次页面加载 ≈ 200-500 行读；
+   - 建议：为 `/api/stats`、`/api/insights` 等聚合接口加 `Cache-Control`（或 CDN 缓存 60s，前端 React Query 已有 60s staleTime），1,000 PV/天也在 50 万行读以内。
+
+5. **防误写**：`push-sync.mjs` 在抓取数量骤降（<200 条或 <60% 在线数）时**中止推送**，避免公示页临时故障把全库误判下线（那会产生 3,109 行 REMOVED 事件写入）。
+
+## 四、同步接口加密（已实现）
+
+`POST /api/sync` 鉴权逻辑（见 `src/app/api/sync/route.ts`）：
+
+- 线上设置环境变量 `SYNC_TOKEN`（生成：`openssl rand -hex 32`）；
+- 请求需带 `Authorization: Bearer <token>`（也支持 `x-sync-token` 头或 `?token=`）；
+- `timingSafeEqual` 防时序攻击；错误一律 401；
+- **未配置 `SYNC_TOKEN` 时放行**（本地/沙箱开发模式），生产务必配置；
+- `GET /api/sync`（只读运行记录）保持公开，无敏感数据。
+
+## 五、部署步骤（Cloudflare Pages）
+
+### 5.1 准备 D1
+
+```bash
+# 安装 wrangler 并登录
+npm i -g wrangler && wrangler login
+
+# 创建数据库（一个就够，Free 计划 10 个）
+wrangler d1 create hebei-tariff
+# 记下输出的 database_id
+
+# 用 Prisma 生成建表 SQL（schema 不变，sqlite 方言直接兼容 D1）
+npx prisma migrate diff \
+  --from-empty --to-schema-datamodel prisma/schema.prisma --script > migrations/0001_init.sql
+
+# 在 D1 中执行（--remote 生产库；--local 本地预览）
+wrangler d1 execute hebei-tariff --remote --file migrations/0001_init.sql
+```
+
+### 5.2 项目改造（Prisma → D1 driver adapter）
+
+```bash
+bun add @prisma/adapter-d1
+```
+
+`prisma/schema.prisma` generator 开启 driverAdapters（其余不变）：
+
+```prisma
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+```
+
+`src/lib/db.ts`（沙箱仍是 SQLite 文件；生产构建走 D1 分支）：
+
+```ts
+import { PrismaClient } from '@prisma/client'
+import { PrismaD1 } from '@prisma/adapter-d1'
+
+function createClient() {
+  // Cloudflare Pages 环境（有 D1 binding）
+  if (process.env.DB instanceof Object) {
+    return new PrismaClient({ adapter: new PrismaD1(process.env.DB as any) })
+  }
+  // 本地开发：SQLite 文件
+  const { PrismaClient: P } = require('@prisma/client')
+  return new P({ datasources: { db: { url: process.env.DATABASE_URL } } })
+}
+export const db = createClient()
+```
+
+### 5.3 Pages 项目
+
+```bash
+# Next.js 全栈上 Pages（App Router + API Routes 均支持，Edge runtime）
+npx @cloudflare/next-on-pages
+npx wrangler pages deploy .vercel/output/static --project-name hebei-tariff-watch
+```
+
+`wrangler.toml`（或 Pages 控制台绑定）：
+
+```toml
+name = "hebei-tariff-watch"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding       = "DB"
+database_name = "hebei-tariff"
+database_id   = "<上一步记下的 id>"
+```
+
+> 注意：`/api/sync` 使用 `fs.readFileSync` 读种子文件——**生产走 `mode:'items'`（远端直传）分支，不触磁盘**；seed 分支仅本地使用。所有 API route 已带 `export const dynamic = 'force-dynamic'`，不会进静态缓存。
+
+### 5.4 环境变量（Pages 控制台 → Settings → Environment variables）
+
+| 变量 | 值 | 说明 |
+|---|---|---|
+| `SYNC_TOKEN` | `openssl rand -hex 32` | 同步接口密钥 |
+| `DATABASE_URL` | （本地开发用） | 沙箱 SQLite 路径，线上可留空 |
+
+### 5.5 首次导入数据
+
+本地跑一次全量种子 → 导出 → 灌入 D1：
+
+```bash
+# 本地：抓取 + 归一化 + 全量导入（scripts/seed-db.ts 沙箱流程）
+# 然后 D1 直灌（也可让线上 /api/sync 走一次 items 推送）
+wrangler d1 execute hebei-tariff --remote --command "SELECT COUNT(*) FROM Tariff;"
+```
+
+或最简方式：先把 `SYNC_API_URL`/`SYNC_TOKEN` 配好，手动触发一次 workflow_dispatch，让 GitHub Actions 把第一次全量数据推上去（diff 引擎自动判全量为 ADDED）。
+
+### 5.6 GitHub Actions Secrets（仓库 Settings → Secrets and variables → Actions）
+
+| Secret | 值 |
+|---|---|
+| `SYNC_API_URL` | `https://<你的站点>.pages.dev/api/sync` |
+| `SYNC_TOKEN` | 与线上环境变量一致的密钥 |
+
+配置完成后，每日 UTC 20:00（北京 04:00）自动抓取推送；也可在 Actions 页面手动 `Run workflow`。
+
+### 5.7 采集出口与节奏（防风控设计）
+
+**WARP 网络出口（四级尝试，前三级均为 Cloudflare WARP 出口）**：
+
+1. **warp-cli TUN 模式**：安装 `cloudflare-warp` apt 包 → 匿名注册 → `warp-cli connect` 建立 TUN 隧道，
+   runner 全机流量（含 Chromium 抓取与同步推送）经 WARP 出口。连接验证用 `cdn-cgi/trace` 确认 `warp=on`，
+   并按 default → MASQUE → WireGuard 三种协议轮换（各 90 秒）。
+2. **warp-cli SOCKS 代理模式**：`warp-cli mode proxy`（本地 `socks5://127.0.0.1:40000`），
+   Chromium 走代理抓取，推送 API 走直连。
+3. **docker 容器化 WARP**（`caomingjun/warp`）：容器内独立 netns 运行 warp-svc + gost 暴露
+   `socks5://127.0.0.1:1080` —— 裸 warp-svc 的 TUN 在 GitHub runner 上数据面可能不通
+   （实测控制面 Connected 但 trace 无 warp=on），容器方案自管 TUN 最稳定。
+4. **直连兜底**：公示页为公开信息页可直抓；在仓库 **Variables** 设置 `WARP_REQUIRED=true`
+   可启用严格模式（WARP 全失败则当日中止，宁缺毋滥）。
+
+要点：
+
+- 每级连接均以「实际出口验证」（trace `warp=on`）为准，不信控制面状态；
+- 运行日志打印出口 `ip/loc/colo` 便于审计；失败时自动输出诊断信息（trace / journalctl / docker logs）；
+- WARP 免费匿名注册即可（`warp-cli registration new`），无需账号、无需 token、不产生费用；
+- 结束时 `if: always()` 断开 warp-cli 并清理 docker 容器。
+
+**真人节奏**（`scripts/scrape.mjs`，防行为风控）：
+
+- 所有等待均为随机区间（`jitter(min, max)`），任意两次运行的节奏都不相同；
+- 滚动是「浏览式」而非「机器式」：每轮 1~3 小步滚动（0.8~1.5 视口/步），步间 0.8~1.8s，
+  轮间 2~4s，15% 概率出现 4~8s 的「阅读停留」+ 轮末直跳绝对底部（懒加载触发器）；
+- 切类型 8~13s、切页签 8~16s、换阶段 8~15s 大间隔随机；
+- 视口尺寸每个 worker 独立微随机（宽 1346~1386 × 高 870~930）；偶发鼠标轨迹漂移；UA 主版本微随机。
+
+**多 worker 并行抓取**（缩短总耗时，`SCRAPE_CONCURRENCY` 默认 2，可 1~4）：
+
+- 4 个采集阶段（个人/政企 × 全网/河北）为独立工作单元，worker pool 并行认领；
+- 每个 worker 独立 browser context（独立 cookie/存储/视口指纹/节奏序列）——
+  相当于同一 WARP 出口（CGNAT 共享 IP）后的多个真实用户同时在浏览，属常态流量画像；
+- worker 内部保持完整真人节奏串行遍历，不牺牲单会话的拟人度；
+- 并发 2：全量约 10~15 分钟（原串行版 20~30 分钟）；并发 4 约 6~8 分钟但注意 runner CPU；
+- 本地验证并行健康度：`SCRAPE_CONCURRENCY=2 SCRAPE_OUT_DIR=/tmp/pt node scripts/scrape.mjs`。
+
+**选择器快速冒烟**（约 1 分钟：导航 + 选河北 + 切首个类型 + 滚 3 轮 + 抽样 3 张卡片名，不写 seed 文件）：
+
+```bash
+SCRAPE_SMOKE=1 node scripts/scrape.mjs   # 本地排查"是选择器坏了还是网络问题"的利器
+```
+
+## 六、常见问题
+
+- **公示页改版了怎么办**：Actions 的 sanity check 会因数量骤降直接失败（不推送），此时需要更新 `scripts/scrape.mjs` 里的选择器（`.tariff-item-container` / `.item-name` / `.tips-attr` 等）。
+- **WARP 连不上怎么办**：workflow 会重试 3 次（每次最多等 30s 验证 `warp=on`），仍失败则当天中止并在 Actions 页面标红。先本地跑 `SCRAPE_SMOKE=1 node scripts/scrape.mjs` 区分「选择器坏了」还是「网络问题」；本地能抓到而 Actions 失败 → 网络/出口问题；两边都抓不到 → 大概率公示页改版。
+- **需要更频繁的更新**：把 `scrape-daily.yml` 的 cron 改成 `0 */6 * * *`（每 6 小时），注意 D1 写入仍只有真实变更行，费用不变；间隔已按真人节奏拉大，频繁抓取请酌情评估对公示页的访问压力。
+- **想回看历史每日快照**：Actions artifacts（保留 90 天）就是每日快照；长期归档可把 `seed/tariffs.normalized.json` commit 回仓库或转存 R2。
+- **为什么不用 Workers Cron 直接 POST**：可以（省 Actions），但抓取必须跑浏览器，Workers 做不到，所以 Actions 是唯一自动化路径。
