@@ -290,7 +290,14 @@ async function phasePersonalNational(w) {
       w.log(`personal/national/${type}: 类型不存在，跳过`)
       continue
     }
-    const count = await scrollAll(w, SMOKE ? 3 : 120)
+    let count = await scrollAll(w, SMOKE ? 3 : 120)
+    if (!SMOKE && count === 0) {
+      // 类型级自愈：0 cards（限流/慢批次）——冷却 60~90s 后重选类型重抓一次
+      w.log(`personal/national/${type}: 0 cards——冷却后重试一次`)
+      await w.jitter(60, 90)
+      await selectType(w, type)
+      count = await scrollAll(w, 120)
+    }
     w.log(`personal/national/${type}: ${count} cards`)
     const cards = count > 0 ? await extractCards(w) : null
     if (SMOKE && cards) {
@@ -310,7 +317,15 @@ async function phasePersonalHebei(w) {
   await w.page.evaluate(() => document.querySelectorAll('.range-tab')[1]?.click())
   await w.jitter(10, 16)
   await waitIdle(w)
-  const count = await scrollAll(w)
+  let count = await scrollAll(w)
+  if (count === 0) {
+    w.log('personal/hebei/all: 0 cards——冷却后重试一次')
+    await w.jitter(60, 90)
+    await w.page.evaluate(() => document.querySelectorAll('.range-tab')[1]?.click())
+    await w.jitter(10, 16)
+    await waitIdle(w)
+    count = await scrollAll(w)
+  }
   w.log(`personal/hebei/all: ${count} cards`)
   if (count > 0) await saveJson(w, await extractCards(w), 'p_h_all.json')
 }
@@ -328,7 +343,13 @@ async function phaseGovNational(w) {
       w.log(`gov/national/${type}: 类型不存在，跳过`)
       continue
     }
-    const count = await scrollAll(w)
+    let count = await scrollAll(w)
+    if (count === 0) {
+      w.log(`gov/national/${type}: 0 cards——冷却后重试一次`)
+      await w.jitter(60, 90)
+      await selectType(w, type)
+      count = await scrollAll(w)
+    }
     w.log(`gov/national/${type}: ${count} cards`)
     if (count > 0) await saveJson(w, await extractCards(w), `g_n_${fileSafe(type)}.json`)
     await w.jitter(3, 6)
@@ -345,7 +366,15 @@ async function phaseGovHebei(w) {
   await w.page.evaluate(() => document.querySelectorAll('.range-tab')[1]?.click())
   await w.jitter(10, 16)
   await waitIdle(w)
-  const count = await scrollAll(w)
+  let count = await scrollAll(w)
+  if (count === 0) {
+    w.log('gov/hebei/all: 0 cards——冷却后重试一次')
+    await w.jitter(60, 90)
+    await w.page.evaluate(() => document.querySelectorAll('.range-tab')[1]?.click())
+    await w.jitter(10, 16)
+    await waitIdle(w)
+    count = await scrollAll(w)
+  }
   w.log(`gov/hebei/all: ${count} cards`)
   if (count > 0) await saveJson(w, await extractCards(w), 'g_h_all.json')
 }
