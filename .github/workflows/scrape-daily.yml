@@ -37,8 +37,9 @@ env:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # WARP 安装/连接约 3~8 分钟 + 全类型真人节奏抓取 10~25 分钟 + 推送重试缓冲
-    timeout-minutes: 40
+    # WARP 安装/连接约 2~6 分钟 + 全类型真人节奏抓取 25~35 分钟（生产实测：v4 验证节奏
+    # + 全量懒加载 2.5 万秒级翻页 + 自愈轮，40 分钟实测不够被超时杀）+ 推送重试缓冲
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

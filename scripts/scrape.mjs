@@ -856,22 +856,34 @@ async function phasePersonalHebei(w) {
       await w.pullCaptures()
       entry = w.api.listByType.get(label)
     }
-    // 接口齐全性自愈：DOM 数 < 捕获 total → 追加一轮滚动（在途批次兜底）
+    let cards = count > 0 ? await extractCards(w) : null
+    /** 唯一方案编号数（生产实测：懒加载翻页风暴会产生重复卡片——DOM 节点数
+     *  会超过接口 total（如 702>666），唯一编号数才是真实的齐全性度量） */
+    const uniqueCount = (cs) => {
+      if (!cs) return 0
+      const codes = cs.map((c) => c.fields?.['方案编号']).filter(Boolean)
+      return codes.length ? new Set(codes).size : cs.length
+    }
+    let unique = uniqueCount(cards)
+    // 接口齐全性自愈：唯一编号数 < 捕获 total → 追加一轮滚动（在途批次/翻页重复兜底）
     let apiTotal = entry ? entry.total : null
-    if (apiTotal != null && count < apiTotal) {
-      w.log(`${label}: DOM ${count} < 明文 total ${apiTotal}——追加一轮滚动自愈`)
+    if (apiTotal != null && unique < apiTotal && !(entry && entry.total === 0)) {
+      w.log(`${label}: 唯一 ${unique} < 明文 total ${apiTotal}——追加一轮滚动自愈`)
       count = await scrollAll(w)
       await w.pullCaptures()
       entry = w.api.listByType.get(label)
       apiTotal = entry ? entry.total : null
+      cards = count > 0 ? await extractCards(w) : cards
+      unique = uniqueCount(cards)
     }
-    w.log(`${label}: ${count} cards（明文 total=${apiTotal ?? '未知'}，beans=${entry ? entry.beans.size : '—'}）`)
-    const cards = count > 0 ? await extractCards(w) : null
+    w.log(
+      `${label}: DOM ${count} cards / 唯一编号 ${unique}（明文 total=${apiTotal ?? '未知'}，beans=${entry ? entry.beans.size : '—'}，firstBeanKeys=${entry?.firstBeanKeys ? entry.firstBeanKeys.slice(0, 8).join(',') : '—'}）`
+    )
     if (cards) {
       for (const c of cards) c._sourceType = label
       await saveJson(w, cards, `p_h_${fileSafe(label)}.json`)
     }
-    results.push({ label, count, apiTotal, note: '' })
+    results.push({ label, count: unique, domCount: count, apiTotal, note: '' })
     await w.jitter(3, 6) // 类型之间的浏览间歇
   }
 
