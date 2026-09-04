@@ -478,7 +478,15 @@ async function phasePersonalHebei(w) {
   await w.jitter(10, 16)
   await waitIdle(w)
 
-  // 枚举类型下拉（标准资费选项依赖选省后 getStandardlist 响应 → 等足两轮再枚举）
+  // 标准资费选项依赖选省后 getStandardlist 响应到位（isShowStandard=true 才会附加到下拉）：
+  // 先等响应（最多 ~50s，WARP 慢出口兜底），再枚举下拉（带 3 次重试）
+  if (!w.api.standard) {
+    w.log('等待 getStandardlist 响应（标准资费选项的附加条件）...')
+    for (let i = 0; i < 12 && !w.api.standard; i++) {
+      await w.jitter(2.5, 4)
+    }
+    w.log(`getStandardlist: ${w.api.standard ? '已捕获' : '未见（该省可能无标准资费或响应超时）'}`)
+  }
   let options = []
   for (let i = 0; i < 3; i++) {
     await openTypeDropdown(w)
