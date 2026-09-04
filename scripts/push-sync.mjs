@@ -26,9 +26,29 @@ if (!Array.isArray(items) || items.length === 0) {
   console.error('种子数据为空，中止推送（防止把线上数据全部判为下线）')
   process.exit(1)
 }
-// 数量异常防御：抓取结果骤降（< 60% 条数）时中止，避免网络故障导致大面积误判下线
-const MIN_RATIO = parseFloat(process.env.MIN_SYNC_RATIO || '0.6')
+// 线上基线闸门（2026-09-04 首跑实测后新增）：推送前拉线上在售数作参照，
+// 本次抓取数 < 线上在售 × MIN_RATIO 时中止——防止漏抓批次（懒加载截断/出口限流）
+// 把大量在线资费误判下线污染时间轴。宁缺毋滥：当天数据缺失可接受，假下线事件不可接受。
+// （首次上线线上为空时自动跳过；真下线潮触发闸门时人工核查后可用 MIN_SYNC_RATIO 环境变量临时放行）
+const MIN_RATIO = parseFloat(process.env.MIN_SYNC_RATIO || '0.8')
 console.log(`待推送 ${items.length} 条（下限比例 ${MIN_RATIO}）`)
+
+try {
+  const statsUrl = new URL(API_URL).origin + '/api/stats'
+  const res = await fetch(statsUrl, { signal: AbortSignal.timeout(15000) })
+  const json = await res.json().catch(() => ({}))
+  const online = Number(json?.data?.online ?? 0)
+  if (online > 0 && items.length < online * MIN_RATIO) {
+    console.error(
+      `⛔ 中止推送：本次抓取 ${items.length} 条 < 线上在售 ${online} 条 × ${MIN_RATIO}` +
+        `（疑似懒加载批次截断或出口限流导致漏抓；宁缺毋滥防假下线，当日数据留待下次同步补全）`
+    )
+    process.exit(1)
+  }
+  console.log(`闸门通过：线上在售 ${online} 条 · 本次抓取 ${items.length} 条`)
+} catch (e) {
+  console.warn(`⚠️ 线上基线获取失败（${e.message}），跳过闸门直接推送`)
+}
 
 const MAX_RETRY = 3
 for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {

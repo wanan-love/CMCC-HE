@@ -145,7 +145,7 @@ jobs:
           node -e "
             const items = require('./seed/tariffs.normalized.json');
             if (!Array.isArray(items) || items.length === 0) { console.error('抓取结果为空'); process.exit(1); }
-            if (items.length < 50) { console.error('抓取数量异常偏少: ' + items.length + '（公示页可能改版，需人工检查选择器）'); process.exit(1); }
+            if (items.length < 100) { console.error('抓取数量异常偏少: ' + items.length + '（公示页可能改版，需人工检查选择器）'); process.exit(1); }
             console.log('sanity ok: ' + items.length + ' items');
           "
 

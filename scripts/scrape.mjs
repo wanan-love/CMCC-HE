@@ -137,7 +137,7 @@ const countCards = (w) =>
  */
 async function scrollAll(w, maxRounds = 120) {
   await waitIdle(w)
-  const stallRounds = 8
+  const stallRounds = 10
   let stall = 0
   let last = 0
   for (let round = 0; round < maxRounds; round++) {
@@ -165,12 +165,22 @@ async function scrollAll(w, maxRounds = 120) {
         () => window.innerHeight + window.scrollY >= document.body.scrollHeight - 100
       )
       if (atBottom) {
-        // 慢出口（WARP/跨境）在途批次兜底：到底后长停顿 6~12s 再数一次，
-        // 有新增则计数清零继续（大列表实测 1318↔450 波动即此因——批次延迟超 stall 窗口被误判完成）
-        await w.jitter(6, 12)
-        const recheck = await countCards(w)
-        if (recheck === now) break // 确认真无新增
-        stall = 0
+        // 慢出口（WARP/跨境）在途批次兜底：到底后最多 3 轮长停顿复查（每轮 8~15s），
+        // 任一轮有新增 → 计数清零回主循环继续滚。生产实测（2026-09-04 首跑）：WARP TUN
+        // 出口下懒加载批次延迟可超 60s，单次复查窗口不足 → 150/502 漏抓；
+        // 3 轮复查 ≈ 24~45s 额外窗口且可多次触发，覆盖慢批次绝大多数到达场景。
+        let confirmed = true
+        for (let r = 0; r < 3; r++) {
+          await w.jitter(8, 15)
+          const again = await countCards(w)
+          if (again > now) {
+            confirmed = false
+            stall = 0
+            last = again
+            break
+          }
+        }
+        if (confirmed) break // 连续 3 轮无新增才认定完成
       } else {
         stall = Math.floor(stall / 2) // 不在底部 → 减半计数继续滚动
       }
