@@ -139,12 +139,28 @@ const API_HOOK_SCRIPT = `(() => {
     JSON.parse = function (text, reviver) {
       const result = origParse.call(JSON, text, reviver)
       try {
-        if (result && typeof result === 'object' && !Array.isArray(result) &&
-            (('returnCode' in result) || ('retCode' in result))) {
+        if (result && typeof result === 'object' && !Array.isArray(result)) {
+          const hasCode = ('returnCode' in result) || ('retCode' in result)
+          // v4.4：非网关信封形态也捕（标准资费响应可能不带 returnCode 包装直接是业务体）
+          const d = result.data
+          const bizShape =
+            (d && typeof d === 'object' && (d.page || Array.isArray(d.beans))) ||
+            (d && (Array.isArray(d) || Array.isArray(d.tariffList))) ||
+            Array.isArray(result.tariffList)
+          if (hasCode || bizShape) {
+            window.__apiCapture.push({
+              t: Date.now(),
+              url: window.__currentXhrUrl || null,
+              parsed: origParse.call(JSON, JSON.stringify(result)),
+            })
+            if (window.__apiCapture.length > 1200) window.__apiCapture.splice(0, 300)
+          }
+        } else if (Array.isArray(result) && result.length && result[0] && typeof result[0] === 'object' && result[0].tariffTable) {
+          // v4.4：数组直接是标准资费表格组列表的形态
           window.__apiCapture.push({
             t: Date.now(),
             url: window.__currentXhrUrl || null,
-            parsed: origParse.call(JSON, JSON.stringify(result)),
+            parsed: { data: result },
           })
           if (window.__apiCapture.length > 1200) window.__apiCapture.splice(0, 300)
         }
@@ -165,25 +181,43 @@ const API_HOOK_SCRIPT = `(() => {
 function classifyCapture(cap) {
   const parsed = cap.parsed || {}
   const url = String(cap.url || '')
-  const body = parsed.rspBody ?? parsed.data
-
-  // 列表分页：data(或 data.data) 内含 page/beans
-  const d = body && typeof body === 'object' && !Array.isArray(body) ? body.data ?? body : null
-  if (d && (d.page || Array.isArray(d.beans))) {
-    return {
-      kind: 'list',
-      endpoint: url.includes('getTariffListInfo') ? 'getTariffListInfo' : 'list(other)',
-      total: Number(d.page?.total ?? 0) || 0,
-      pageNumber: Number(d.page?.pageNumber ?? 0) || 0,
-      beans: Array.isArray(d.beans) ? d.beans : [],
+  // v4.4：body 多退一层（parsed 自身也可能是业务体——非网关包装形态）；
+  // 注：URL 标签存在异步污染（axios 拦截器在 promise 微任务中 parse，同步窗口外
+  // 标签为 null 或串到其他在途请求）——分类以【形状】为准，URL 仅诊断用
+  for (const body of [parsed.rspBody ?? parsed.data, parsed]) {
+    if (body == null) continue
+    // 列表分页：data(或 data.data) 内含 page/beans
+    const d = body && typeof body === 'object' && !Array.isArray(body) ? body.data ?? body : null
+    if (d && (d.page || Array.isArray(d.beans))) {
+      return {
+        kind: 'list',
+        endpoint: url.includes('getTariffListInfo') ? 'getTariffListInfo' : 'list(other)',
+        total: Number(d.page?.total ?? 0) || 0,
+        pageNumber: Number(d.page?.pageNumber ?? 0) || 0,
+        beans: Array.isArray(d.beans) ? d.beans : [],
+      }
+    }
+    // 标准资费：全部表格组（官方页面只用第一组，此处全量提取）
+    const tables = extractStandardTables(body)
+    if (tables) {
+      return { kind: 'standard', endpoint: 'getStandardlist', tables }
     }
   }
-  // 标准资费：全部表格组（官方页面只用第一组，此处全量提取）
-  const tables = extractStandardTables(body)
-  if (tables) {
-    return { kind: 'standard', endpoint: 'getStandardlist', tables }
-  }
   return { kind: 'other', endpoint: url || 'unknown' }
+}
+
+/** 未分类捕获的浅摘要（诊断 dump 用：截断防爆炸） */
+function otherCaptureDigest(api) {
+  const out = []
+  for (const cap of api.otherCaptures || []) {
+    try {
+      const s = JSON.stringify(cap.parsed)
+      out.push({ t: cap.t, url: cap.url, body: s ? s.slice(0, 400) : null })
+    } catch {
+      out.push({ t: cap.t, url: cap.url, body: null })
+    }
+  }
+  return out
 }
 
 /** 从标准资费明文提取全部表格组（数组 / tariffList / data 再嵌套三种形态通吃） */
@@ -273,6 +307,8 @@ async function createWorker(id) {
     standardCapturedAt: 0,
     /** 其他形态捕获数（诊断用） */
     other: 0,
+    /** 未分类捕获的原文（v4.4 诊断：定位标准资费响应的真实形态） */
+    otherCaptures: [],
     /** 端点命中统计（诊断用） */
     endpoints: new Map(),
   }
@@ -300,6 +336,7 @@ async function createWorker(id) {
         api.standardCapturedAt = Date.now()
       } else {
         api.other++
+        if (api.otherCaptures.length < 30) api.otherCaptures.push(cap)
       }
     }
   }
@@ -766,6 +803,7 @@ function writeIncrementalReport(w, results, done = false) {
       mechanism: 'JSON.parse 应用层明文捕获（isWX 通道解密必经点）+ XHR URL 关联',
       endpoints: Object.fromEntries(w.api.endpoints),
       otherCaptures: w.api.other,
+      otherCaptureDigest: otherCaptureDigest(w.api),
       initialType: '套餐',
     },
     types: results,
@@ -895,7 +933,17 @@ async function phasePersonalHebei(w) {
         await saveJson(w, items, `p_h_${fileSafe(label)}.json`)
         results.push({ label, count: items.length, apiTotal: items.length, note })
       } else {
-        // 选项存在却拿不到数据：页面声明有标准资费但捕获/DOM 均空 → 判失败（宁缺毋滥）
+        // 选项存在却拿不到数据：dump 现场（未分类捕获摘要 + 标准视图 DOM 片段）供离线分析，
+        // 然后判失败（宁缺毋滥）
+        try {
+          const domHtml = await w.page.evaluate(() => {
+            const box = document.querySelector('.free-cont-box, .freeContent-table, .StandarTariff')
+            const root = box || document.querySelector('#app') || document.body
+            return (root.innerHTML || '').slice(0, 3000)
+          })
+          writeFileSync(join(API_DUMP_DIR, 'standard-dom.html'), domHtml, 'utf-8')
+          w.log('标准资费现场已 dump（seed/api/standard-dom.html）')
+        } catch {}
         results.push({ label, count: 0, apiTotal: null, note: '选项存在但明文/DOM 均未取到数据' })
       }
       await w.jitter(3, 6)
