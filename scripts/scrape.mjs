@@ -1,36 +1,48 @@
 /**
  * 中国移动河北资费公示抓取 —— GitHub Actions / 本地通用版（Playwright）
  * 运行: node scripts/scrape.mjs   （需先: npm i playwright && npx playwright install --with-deps chromium）
- * 冒烟: SCRAPE_SMOKE=1 node scripts/scrape.mjs  （验证导航+选择器+类型枚举健康，不落盘）
+ * 冒烟: SCRAPE_SMOKE=1 node scripts/scrape.mjs  （验证导航+选择器+类型枚举+捕获通道健康，不落盘）
+ * 离线回归: node scripts/mock-site.mjs 后 SCRAPE_URL=http://localhost:3939/tariff.html node scripts/scrape.mjs
  *
  * 采集范围：仅「个人资费 · 河北省专属」，但覆盖【全部资费类型】——
  *   套餐 / 加装包 / 营销活动 / 港澳台(国际)资费 / 标准资费（以及页面动态提供的
  *   国际及港澳台标准资费、其他）。类型下拉选项在运行时动态枚举，页面未来增删
  *   类型无需改本脚本。
  *
- * ── 逆向接口齐全性校验（2026-09-04 逆向自页面 JS bundle）──────────────────
+ * ── 逆向接口（2026-09-04 二次逆向修正，v4 关键发现）────────────────────────
  * 前端结构：tariffZonePers.html → Vue + webpack 动态 chunk
- *   （tariffZonePers.js 入口 + templateCollection.js 模板集 + chunk 155 NavBarNew
- *    导航/列表分页 + chunk 837 tariffSerial 卡片 + chunk 929/715/88/814 标准资费表格）
- * 关键接口（base https://h.app.coc.10086.cn）：
+ *   （tariffZonePers.js 入口 + chunk-155 NavBarNew 导航/列表分页 + chunk-837
+ *    tariffSerial 卡片 + chunk-929 等 StandarTariff 标准资费表格）
+ * 接口（base https://h.app.coc.10086.cn，请求库为 axios/XHR）：
  *   1) 列表分页 POST /website/nrapigate/nrtariff/new/Tariff/getTariffListInfo
- *      body {cellNum:'99999999999', province:'311', isPublic:'1', linkScn:'1',
- *            tariffAttr:'1'全网|'2'分省, type1:'1'个人|'2'政企, type2:'1'..'7',
- *            page, limit:5}
- *      resp rspBody.(data?).{page:{total,pageNumber,pageSize}, beans:[卡片原始数据]}
- *   2) 标准资费 POST /website/nrapigate/nrtariff/new/Tariff/getStandardlist
- *      body {province, isPublic:'1'}
- *      resp rspBody[0].tariffTable 或 rspBody.tariffList[0].tariffTable =
- *           {tHead:[{任意键:列名}], tBody:[{任意键:单元格值}]}
- *   3) 类型可用性 POST /website/nrapigate/nrtariff/new/Tariff/getType2List
- *   4) 类型值映射（bundle chunk-155 module 0x15ae 硬编码）：
- *      1套餐 2加装包 3营销活动 4港澳台/国际资费 5标准资费(特殊'标准资费VALUE'，
- *      仅分省页签且标准数据存在时出现在下拉中，不走列表 API) 6国际及港澳台标准资费 7其他
+ *      body {province:'311', isPublic:'1', tariffAttr:'2'分省, type1:'1'个人,
+ *            type2:'1'~'7', page, limit:5}
+ *   2) 标准资费 POST .../getStandardlist {province, isPublic} → rspBody 为
+ *      数组或 {tariffList:[...]}，每组 {tariffTable:{tHead,tBody}}——
+ *      官方页面只用 tariffList[0]（首组表格），本脚本提取【全部组】
+ *   3) 类型可用性 POST .../getType2List
+ *   4) 类型值映射（chunk-155 硬编码）：1套餐/2加装包/3营销活动/4港澳台国际/
+ *      5标准资费(特殊值，仅分省页签且数据存在时出现)6国际及港澳台标准/7其他
  *   5) 懒加载：scroll-flag 元素进入视口触发下一页（每页 5 条）
  *
- *   本脚本在浏览器侧拦截以上 XHR 响应：以接口声明的 page.total 为基准逐一核对
- *   每个类型实际抓到的 DOM 卡片数（DOM = API beans 的渲染结果，理论应严格相等），
- *   不足即自愈重抓，仍不足则本脚本以非零码失败 → workflow 不推送，杜绝漏抓上线。
+ *   ★ v4 关键发现：这些接口走 isWX 加密通道——请求体经 ff() 加密后发出，
+ *     响应为 {body:'<密文>'} 信封，在 axios 响应拦截器内经 F6() 解密后
+ *     JSON.parse 才得到业务明文（chunk-common.js 响应拦截器实证）。
+ *     ⇒ 网络层（page.on('response')）永远拿不到 page.total / beans / 表格——
+ *     v3 的"接口 total=未知 ⚠ 未核对"即因此失效，齐全性闸门形同虚设。
+ *   ⇒ v4 方案：addInitScript 在页面任何 JS 之前 hook 全局 JSON.parse（解密
+ *     明文必经之路），并包装 XHR open/onreadystatechange 把"当前请求 URL"
+ *     传递给捕获点，实现【应用层明文捕获 + 端点精确关联】：
+ *     - getTariffListInfo 明文 → page.total（齐全性基准）+ beans（原始数据）
+ *     - getStandardlist 明文 → 全部标准资费表格组
+ *
+ *   齐全性门禁（宁缺毋滥，比 v3 严格）：
+ *     - 选项在下拉中存在 ⇒ 该类型必须有数据：count==0 且 apiTotal!=0（含
+ *       未知）即 FAILED——2026-09-04 事故（套餐被下拉切换 bug 跳过 → 0 条
+ *       照常推送 → 502 套餐全部误判下线）根因修复之一；
+ *     - count>0 且 apiTotal 已知 ⇒ 必须 count >= apiTotal（自愈重滚后仍不足
+ *       即 FAILED）；apiTotal 未知（捕获通道异常）⇒ 降级 ⚠ 通过但报告显式标注。
+ *     任一 FAILED → 非零退出 → workflow 中止，不推送。
  *
  * 网络出口：GitHub Actions 中由 workflow 先连接 Cloudflare WARP（TUN 或 docker
  *   socks5 代理），Chromium 的全部请求自然经 WARP 出口，避免数据中心 IP 被风控。
@@ -38,14 +50,16 @@
  *
  * 真人节奏（防风控核心，处处随机不可预测）：
  *   1. 所有等待均带随机抖动 jitter(min,max)——没有两次运行的节奏相同；
- *   2. 滚动是「浏览式」而非「机器式」：每轮 1~3 小步滚动 + 轮末直跳绝对底部（懒加载触发器），
- *      步间 0.8~1.8s，轮间 2~5s，15% 概率 5~9s「阅读停留」；
+ *   2. 滚动是「浏览式」而非「机器式」：每轮 1~3 小步滚动 + 轮末直跳绝对底部
+ *      （懒加载触发器），步间 0.8~1.8s，轮间 2~5s，15% 概率 5~9s「阅读停留」；
  *   3. 切类型/切页签 8~16s、重试冷却 60~90s 大间隔随机；
  *   4. 视口尺寸微随机（宽 1346~1386 / 高 870~930）；
  *   5. 偶发鼠标轨迹漂移（mouseDrift），补充真实指针事件。
  *
- * 输出: seed/p_h_<类型>.json（各类型卡片数组，卡片内含 _sourceType 标记来源类型，
- *   供 normalize.mjs 归类兜底）；seed/api/api-report.json（逆向接口齐全性报告）。
+ * 输出: seed/p_h_<类型>.json（各类型卡片数组，卡片内含 _sourceType 标记来源类型）；
+ *   seed/api/api-report.json（应用层捕获的齐全性报告）
+ *   seed/api/beans-<类型>.json（接口 beans 原始数据，供未来数据源直连分析）
+ *   seed/api/standard-raw.json（标准资费解密明文）
  */
 import { chromium } from 'playwright'
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -57,22 +71,11 @@ const OUT_DIR = process.env.SCRAPE_OUT_DIR || join(__dirname, '..', 'seed')
 const API_DUMP_DIR = join(OUT_DIR, 'api')
 const SMOKE = !!process.env.SCRAPE_SMOKE
 const URL =
+  process.env.SCRAPE_URL ||
   'https://h.app.coc.10086.cn/cmcc-app/pc-pages/tariffZonePers.html?pageId=834148205904408576&prov=531'
 
-/** 类型值映射（逆向自 chunk-155 module 0x15ae：label ↔ type2 值） */
-const TYPE_VALUE = {
-  套餐: '1',
-  加装包: '2',
-  营销活动: '3',
-  '港澳台/国际资费': '4',
-  标准资费: '5',
-  国际及港澳台标准资费: '6',
-  其他: '7',
-}
-/** 标准资费在下拉中的特殊值（选中后容器切换为 StandarTariff 表格视图，不走列表 API） */
-const STANDARD_VALUE = '标准资费VALUE'
-/** 采集范围固定：个人(type1='1') × 河北分省(tariffAttr='2') */
-const SCOPE_KEY = `1|2|`
+/** 文件名安全化（'港澳台/国际资费' → '港澳台_国际资费'） */
+const fileSafe = (s) => s.replace(/\//g, '_')
 
 mkdirSync(OUT_DIR, { recursive: true })
 mkdirSync(API_DUMP_DIR, { recursive: true })
@@ -83,14 +86,164 @@ const rand = (min, max) => min + Math.random() * (max - min)
 const startedAt = Date.now()
 const tlog = (msg) => console.log(`[${Math.round((Date.now() - startedAt) / 1000)}s] ${msg}`)
 
-/** 文件名安全化（'港澳台/国际资费' → '港澳台_国际资费'） */
-const fileSafe = (s) => s.replace(/\//g, '_')
-
 const browser = await chromium.launch({
   headless: true,
   // WARP SOCKS 代理模式降级：workflow 注入 WARP_SOCKS 时 Chromium 走本地 socks5 代理
   ...(process.env.WARP_SOCKS ? { proxy: { server: process.env.WARP_SOCKS } } : {}),
 })
+
+/**
+ * 应用层捕获 init script（在任何页面 JS 之前注入，每次导航自动重放）：
+ *  1. 包装 XMLHttpRequest.prototype.open —— 实例上记录请求 URL；
+ *  2. 包装 onreadystatechange setter —— axios 以此绑定响应处理，处理函数
+ *     执行期间把实例 URL 放到 window.__currentXhrUrl（拦截器内的 JSON.parse
+ *     与 XHR 处理同栈同步执行，可精确读到端点 URL）；
+ *  3. 包装 JSON.parse —— 捕获含 returnCode 的网关明文（解密必经点），
+ *     push 到 window.__apiCapture（数组元素 {t, url, parsed}）。
+ *     一切异常静默吞掉，绝不影响页面自身行为。
+ */
+const API_HOOK_SCRIPT = `(() => {
+  try {
+    if (window.__apiCaptureInstalled) return
+    window.__apiCaptureInstalled = true
+    window.__apiCapture = []
+    window.__currentXhrUrl = null
+
+    const xhrProto = XMLHttpRequest.prototype
+    const origOpen = xhrProto.open
+    xhrProto.open = function (method, url) {
+      try { this.__hookUrl = String(url) } catch (e) {}
+      return origOpen.apply(this, arguments)
+    }
+
+    const desc = Object.getOwnPropertyDescriptor(xhrProto, 'onreadystatechange')
+    if (desc && desc.configurable && desc.set && desc.get) {
+      Object.defineProperty(xhrProto, 'onreadystatechange', {
+        configurable: true,
+        enumerable: true,
+        get: function () { return desc.get.call(this) },
+        set: function (fn) {
+          if (typeof fn !== 'function') { desc.set.call(this, fn); return }
+          const wrapped = function () {
+            const prev = window.__currentXhrUrl
+            window.__currentXhrUrl = this.__hookUrl || null
+            try { return fn.apply(this, arguments) }
+            finally { window.__currentXhrUrl = prev }
+          }
+          desc.set.call(this, wrapped)
+        },
+      })
+    }
+
+    const origParse = JSON.parse
+    JSON.parse = function (text, reviver) {
+      const result = origParse.call(JSON, text, reviver)
+      try {
+        if (result && typeof result === 'object' && !Array.isArray(result) &&
+            (('returnCode' in result) || ('retCode' in result))) {
+          window.__apiCapture.push({
+            t: Date.now(),
+            url: window.__currentXhrUrl || null,
+            parsed: origParse.call(JSON, JSON.stringify(result)),
+          })
+          if (window.__apiCapture.length > 1200) window.__apiCapture.splice(0, 300)
+        }
+      } catch (e) {}
+      return result
+    }
+  } catch (e) {}
+})()`
+
+/* ---------- 捕获分类（Node 侧，消费页面捕获缓冲） ---------- */
+
+/**
+ * 判定一条明文捕获属于哪个端点、解析出结构化信息。
+ * 明文形态（逆向实证）：{ returnCode, returnMessage, data }，
+ * data 即业务 rspBody：列表 = {page:{total,pageNumber}, beans:[]}（可能再包
+ * 一层 data）；标准资费 = 数组或 {tariffList:[{tariffTable:{tHead,tBody}}]}。
+ */
+function classifyCapture(cap) {
+  const parsed = cap.parsed || {}
+  const url = String(cap.url || '')
+  const body = parsed.rspBody ?? parsed.data
+
+  // 列表分页：data(或 data.data) 内含 page/beans
+  const d = body && typeof body === 'object' && !Array.isArray(body) ? body.data ?? body : null
+  if (d && (d.page || Array.isArray(d.beans))) {
+    return {
+      kind: 'list',
+      endpoint: url.includes('getTariffListInfo') ? 'getTariffListInfo' : 'list(other)',
+      total: Number(d.page?.total ?? 0) || 0,
+      pageNumber: Number(d.page?.pageNumber ?? 0) || 0,
+      beans: Array.isArray(d.beans) ? d.beans : [],
+    }
+  }
+  // 标准资费：全部表格组（官方页面只用第一组，此处全量提取）
+  const tables = extractStandardTables(body)
+  if (tables) {
+    return { kind: 'standard', endpoint: 'getStandardlist', tables }
+  }
+  return { kind: 'other', endpoint: url || 'unknown' }
+}
+
+/** 从标准资费明文提取全部表格组（数组 / tariffList / data 再嵌套三种形态通吃） */
+function extractStandardTables(body) {
+  if (!body) return null
+  let groups = null
+  if (Array.isArray(body)) groups = body
+  else if (Array.isArray(body.tariffList)) groups = body.tariffList
+  else if (body.data && (Array.isArray(body.data) || Array.isArray(body.data?.tariffList))) {
+    groups = Array.isArray(body.data) ? body.data : body.data.tariffList
+  }
+  if (!groups || !Array.isArray(groups)) return null
+  const tables = []
+  for (const g of groups) {
+    const tt = g && g.tariffTable
+    if (tt && Array.isArray(tt.tHead) && Array.isArray(tt.tBody)) {
+      tables.push({
+        title:
+          (typeof g.tableTitle === 'string' && g.tableTitle) ||
+          (typeof g.tariffName === 'string' && g.tariffName) ||
+          (typeof g.title === 'string' && g.title) ||
+          null,
+        tHead: tt.tHead,
+        tBody: tt.tBody,
+      })
+    }
+  }
+  return tables.length ? tables : null
+}
+
+/** 表格组 → 卡片数组（tHead 键名/位置两维解析，行字段映射 + 组名标注） */
+function standardTablesToItems(tables) {
+  const items = []
+  for (const tbl of tables) {
+    const heads = (tbl.tHead || []).filter(Boolean)
+    const keys = heads.map((h) => Object.keys(h)[0])
+    const titles = heads.map((h, i) => (keys[i] != null ? String(h[keys[i]]) : `列${i + 1}`))
+    for (const row of tbl.tBody || []) {
+      if (!row) continue
+      const fields = {}
+      titles.forEach((t, i) => {
+        const v = row[keys[i]] ?? row[`field${i + 1}`] ?? ''
+        if (String(v ?? '').trim() !== '') fields[t] = String(v).trim()
+      })
+      if (Object.keys(fields).length === 0) continue
+      fields['资费类型'] = '标准资费'
+      if (tbl.title) fields['所属表格'] = tbl.title
+      const name =
+        fields['资费名称'] ||
+        fields['业务名称'] ||
+        fields['项目'] ||
+        fields['业务'] ||
+        fields['服务名称'] ||
+        Object.values(fields)[0] ||
+        '未命名标准资费'
+      items.push({ name, fields, usage: [], gray: {}, _sourceType: '标准资费' })
+    }
+  }
+  return items
+}
 
 /**
  * 创建一个 worker（= 一个"虚拟用户"）：
@@ -107,46 +260,69 @@ async function createWorker(id) {
   const context = await browser.newContext({ userAgent: ua, viewport })
   const page = await context.newPage()
   page.setDefaultTimeout(30000)
+  await page.addInitScript(API_HOOK_SCRIPT)
 
-  /* ---------- 逆向接口拦截（齐全性校验的数据源） ---------- */
+  /* ---------- 应用层捕获状态（Node 侧聚合） ---------- */
   const api = {
-    /** key = `${type1}|${tariffAttr}|${type2}` → {total, beans, pages, lastSeen} */
-    lists: new Map(),
-    /** getStandardlist 原始响应（选省后自动触发） */
-    standard: null,
-    /** getType2List 原始响应（页面可用类型清单） */
-    typesList: null,
+    /** 当前归属类型 label（列表捕获的归属轴） */
+    currentType: null,
+    /** label → {total, beans:Map(beanJson→bean), pages, maxPageNumber, firstBeanKeys} */
+    listByType: new Map(),
+    /** 标准资费全部表格组（明文） */
+    standardTables: null,
+    standardCapturedAt: 0,
+    /** 其他形态捕获数（诊断用） */
+    other: 0,
+    /** 端点命中统计（诊断用） */
+    endpoints: new Map(),
   }
-  page.on('response', async (resp) => {
-    try {
-      const url = resp.url()
-      if (!/nrapigate\/nrtariff/.test(url)) return
-      const method = resp.request().method()
-      if (method !== 'POST') return
-      const body = await resp.json().catch(() => null)
-      if (!body) return
 
-      if (url.includes('getTariffListInfo')) {
-        const req = JSON.parse(resp.request().postData() || '{}')
-        const key = `${req.type1}|${req.tariffAttr}|${req.type2}`
-        const data = body?.rspBody?.data ?? body?.rspBody ?? {}
-        const total = Number(data?.page?.total ?? 0) || 0
-        const beansN = Array.isArray(data?.beans) ? data.beans.length : 0
-        const e = api.lists.get(key) || { total: 0, beans: 0, pages: 0 }
-        if (total > e.total) e.total = total
-        e.beans += beansN
-        e.pages += 1
-        e.label = Object.keys(TYPE_VALUE).find((l) => TYPE_VALUE[l] === req.type2)
-        api.lists.set(key, e)
-      } else if (url.includes('getStandardlist')) {
-        api.standard = body
-      } else if (url.includes('getType2List')) {
-        api.typesList = body
+  /** 消费页面捕获缓冲并按端点/归属聚合 */
+  function ingest(caps) {
+    for (const cap of caps) {
+      const info = classifyCapture(cap)
+      const ep = info.endpoint || 'unknown'
+      api.endpoints.set(ep, (api.endpoints.get(ep) || 0) + 1)
+      if (info.kind === 'list') {
+        const label = api.currentType || '（初始加载）'
+        let e = api.listByType.get(label)
+        if (!e) {
+          e = { total: 0, beans: new Map(), pages: 0, maxPageNumber: 0, firstBeanKeys: null }
+          api.listByType.set(label, e)
+        }
+        if (info.total > e.total) e.total = info.total
+        if (info.pageNumber > e.maxPageNumber) e.maxPageNumber = info.pageNumber
+        e.pages++
+        if (!e.firstBeanKeys && info.beans.length) e.firstBeanKeys = Object.keys(info.beans[0])
+        for (const b of info.beans) e.beans.set(JSON.stringify(b), b)
+      } else if (info.kind === 'standard') {
+        api.standardTables = info.tables
+        api.standardCapturedAt = Date.now()
+      } else {
+        api.other++
       }
-    } catch {
-      /* 拦截失败不影响主流程（齐全性报告会显式暴露缺失） */
     }
-  })
+  }
+
+  /** 拉取页面捕获缓冲（导航瞬间会失败，静默跳过） */
+  async function pullCaptures() {
+    try {
+      const caps = await page.evaluate(() => {
+        const arr = window.__apiCapture || []
+        const out = arr.slice()
+        arr.length = 0
+        return out
+      })
+      if (caps && caps.length) ingest(caps)
+    } catch {
+      /* 导航中执行上下文销毁等瞬态，忽略 */
+    }
+  }
+
+  // 周期性拉取（2.5s）：与主流程异步交错，Playwright 命令队列天然串行安全
+  const pullTimer = setInterval(() => {
+    pullCaptures().catch(() => {})
+  }, 2500)
 
   const w = {
     id,
@@ -154,6 +330,9 @@ async function createWorker(id) {
     page,
     viewport,
     api,
+    pullCaptures,
+    ingest,
+    stopPuller: () => clearInterval(pullTimer),
     log: (msg) => console.log(`[${Math.round((Date.now() - startedAt) / 1000)}s w${id}] ${msg}`),
     jitter: (minS, maxS) => page.waitForTimeout(rand(minS, maxS) * 1000),
   }
@@ -213,8 +392,13 @@ async function scrollAll(w, maxRounds = 120) {
   const stallRounds = 10
   let stall = 0
   let last = 0
+  let emptyRounds = 0
   for (let round = 0; round < maxRounds; round++) {
     const prev = await countCards(w)
+    if (prev === 0) emptyRounds++
+    else emptyRounds = 0
+    // 0 卡片兜底：空转 12 轮（≈2 分钟无内容）提前退出，交由外层类型级自愈/失败
+    if (emptyRounds >= 12) break
     const steps = 1 + Math.floor(Math.random() * 3)
     for (let s = 0; s < steps; s++) {
       await w.page.evaluate(() => {
@@ -275,6 +459,17 @@ async function resetToHebei(w) {
   })
   await w.jitter(6, 10)
   await waitIdle(w)
+  await w.pullCaptures()
+  // 选省会触发 getStandardlist（分省页签标准资费选项的附加条件）；慢出口下
+  // 稍等捕获到位（最多 ~40s），到位与否都继续（报告会显式暴露）
+  if (!w.api.standardTables) {
+    w.log('等待 getStandardlist 明文捕获（标准资费选项的附加条件）...')
+    for (let i = 0; i < 10 && !w.api.standardTables; i++) {
+      await w.jitter(2.5, 4)
+      await w.pullCaptures()
+    }
+    w.log(`getStandardlist: ${w.api.standardTables ? '已捕获' : '未见（该省可能无标准资费或响应慢）'}`)
+  }
 }
 
 /** 提取当前页全部资费卡片（选择器经生产数据验证：tariffSerial chunk-837） */
@@ -328,8 +523,64 @@ async function extractCards(w) {
 
 /* ---------- 资费类型下拉操作（NavBarNew chunk-155 MySelect DOM） ---------- */
 
-/** 打开类型下拉（点 .select-box），返回 'ok' | 'nf' */
+/** 当前选中的类型文本（.select-box 展示文案，选中验证用） */
+async function readSelectedType(w) {
+  return w.page.evaluate(() => {
+    const root = (() => {
+      const labels = [...document.querySelectorAll('.select-label')]
+      const lb = labels.find((el) => (el.innerText || '').trim().replace(/[:：]/, '') === '资费类型')
+      let r = null
+      if (lb) {
+        const box = lb.parentElement?.querySelector('.select-box')
+        r = box ? box.closest('.select-container') || lb.parentElement : lb.parentElement
+      }
+      if (!r) {
+        const sb = document.querySelector('.select-box')
+        r = sb ? sb.closest('.select-container') || sb.parentElement : null
+      }
+      return r
+    })()
+    if (!root) return null
+    const box = root.querySelector('.select-box')
+    return box ? (box.innerText || '').trim() : null
+  })
+}
+
+/** 下拉当前是否展开（存在可见 .select-item） */
+async function isDropdownOpen(w) {
+  return (
+    (
+      await w.page.evaluate(() => {
+        const root = typeSelectRoot()
+        function typeSelectRoot() {
+          const labels = [...document.querySelectorAll('.select-label')]
+          const lb = labels.find((el) => (el.innerText || '').trim().replace(/[:：]/, '') === '资费类型')
+          let r = null
+          if (lb) {
+            const box = lb.parentElement?.querySelector('.select-box')
+            r = box ? box.closest('.select-container') || lb.parentElement : lb.parentElement
+          }
+          if (!r) {
+            const sb = document.querySelector('.select-box')
+            r = sb ? sb.closest('.select-container') || sb.parentElement : null
+          }
+          return r
+        }
+        if (!root) return 0
+        const visible = [...root.querySelectorAll('.select-item')].filter((e) => e.offsetParent !== null)
+        return visible.length
+      })
+    ) > 0
+  )
+}
+
+/**
+ * 打开类型下拉——★幂等（v4 事故修复）：先探测是否已展开，展开则直接返回，
+ * 绝不二次点击 .select-box（v3 在枚举后下拉保持展开，主循环首次再点把下拉
+ * 收起 → 首个类型「选项消失」跳过 → 套餐 0 条照常推送 → 502 套餐全被误判下线）。
+ */
 async function openTypeDropdown(w) {
+  if (await isDropdownOpen(w)) return 'ok'
   await mouseDrift(w)
   const res = await w.page.evaluate(() => {
     const labels = [...document.querySelectorAll('.select-label')]
@@ -345,20 +596,33 @@ async function openTypeDropdown(w) {
   return res
 }
 
+/** 收起下拉（再点一次 box；未展开则不动） */
+async function closeTypeDropdown(w) {
+  if (!(await isDropdownOpen(w))) return
+  await w.page.evaluate(() => {
+    const sb = document.querySelector('.select-box')
+    sb?.click()
+  })
+  await w.jitter(0.8, 1.6)
+}
+
 /** 枚举当前展开下拉中的全部类型选项（可见 .select-item 文本，含'标准资费'） */
 async function listTypeOptions(w) {
   return w.page.evaluate(() => {
-    const labels = [...document.querySelectorAll('.select-label')]
-    const lb = labels.find((el) => (el.innerText || '').trim().replace(/[:：]/, '') === '资费类型')
-    let root = null
-    if (lb) {
-      const box = lb.parentElement?.querySelector('.select-box')
-      root = box ? box.closest('.select-container') || lb.parentElement : lb.parentElement
-    }
-    if (!root) {
-      const sb = document.querySelector('.select-box')
-      root = sb ? sb.closest('.select-container') || sb.parentElement : null
-    }
+    const root = (() => {
+      const labels = [...document.querySelectorAll('.select-label')]
+      const lb = labels.find((el) => (el.innerText || '').trim().replace(/[:：]/, '') === '资费类型')
+      let r = null
+      if (lb) {
+        const box = lb.parentElement?.querySelector('.select-box')
+        r = box ? box.closest('.select-container') || lb.parentElement : lb.parentElement
+      }
+      if (!r) {
+        const sb = document.querySelector('.select-box')
+        r = sb ? sb.closest('.select-container') || sb.parentElement : null
+      }
+      return r
+    })()
     if (!root) return []
     return [...root.querySelectorAll('.select-item')]
       .filter((e) => e.offsetParent !== null)
@@ -371,17 +635,20 @@ async function listTypeOptions(w) {
 async function clickTypeOption(w, label) {
   return w.page.evaluate(
     (t) => {
-      const labels = [...document.querySelectorAll('.select-label')]
-      const lb = labels.find((el) => (el.innerText || '').trim().replace(/[:：]/, '') === '资费类型')
-      let root = null
-      if (lb) {
-        const box = lb.parentElement?.querySelector('.select-box')
-        root = box ? box.closest('.select-container') || lb.parentElement : lb.parentElement
-      }
-      if (!root) {
-        const sb = document.querySelector('.select-box')
-        root = sb ? sb.closest('.select-container') || sb.parentElement : null
-      }
+      const root = (() => {
+        const labels = [...document.querySelectorAll('.select-label')]
+        const lb = labels.find((el) => (el.innerText || '').trim().replace(/[:：]/, '') === '资费类型')
+        let r = null
+        if (lb) {
+          const box = lb.parentElement?.querySelector('.select-box')
+          r = box ? box.closest('.select-container') || lb.parentElement : lb.parentElement
+        }
+        if (!r) {
+          const sb = document.querySelector('.select-box')
+          r = sb ? sb.closest('.select-container') || sb.parentElement : null
+        }
+        return r
+      })()
       if (!root) return 'nf'
       const items = [...root.querySelectorAll('.select-item')].filter((e) => e.offsetParent !== null)
       const hit = items.find((e) => (e.innerText || '').trim() === t)
@@ -395,52 +662,46 @@ async function clickTypeOption(w, label) {
   )
 }
 
-/* ---------- 标准资费（StandarTariff 表格视图） ---------- */
-
-/** 从拦截到的 getStandardlist 响应构造卡片（tHead/tBody 两种键名形态通吃） */
-function standardItemsFromApi(json) {
-  const body = json?.rspBody
-  const tt = Array.isArray(body)
-    ? body?.[0]?.tariffTable ?? null
-    : body?.tariffList?.[0]?.tariffTable ?? null
-  if (!tt || !Array.isArray(tt.tHead) || !Array.isArray(tt.tBody)) return null
-  const heads = tt.tHead.filter(Boolean)
-  const keys = heads.map((h) => Object.keys(h)[0])
-  const titles = heads.map((h, i) => (keys[i] != null ? String(h[keys[i]]) : `列${i + 1}`))
-  const items = []
-  for (const row of tt.tBody) {
-    if (!row) continue
-    const fields = {}
-    titles.forEach((t, i) => {
-      const v = row[keys[i]] ?? row[`field${i + 1}`] ?? ''
-      if (String(v ?? '').trim() !== '') fields[t] = String(v).trim()
-    })
-    if (Object.keys(fields).length === 0) continue
-    fields['资费类型'] = '标准资费'
-    const name =
-      fields['资费名称'] ||
-      fields['业务名称'] ||
-      fields['项目'] ||
-      fields['业务'] ||
-      fields['服务名称'] ||
-      Object.values(fields)[0] ||
-      '未命名标准资费'
-    items.push({ name, fields, usage: [], gray: {} })
+/**
+ * 选择指定类型（幂等下拉 + 点击 + 选中验证 + 归属切换）：
+ *  - 点击后读 .select-box 文案验证选中生效，失败重试一次（再开下拉再点）；
+ *  - 选中即切换 w.api.currentType —— 后续列表明文捕获归属到该类型。
+ */
+async function selectType(w, label) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await openTypeDropdown(w)
+    const res = await clickTypeOption(w, label)
+    // ★点击即切换归属：页 1 响应在 jitter 期间到达也能正确归属（v4.1 修复
+    //   「归属滞后一拍」——否则首页明文被周期拉取器归给上一个类型）
+    if (res === 'ok') w.api.currentType = label
+    await w.jitter(8, 14)
+    if (res === 'nf') return 'nf'
+    await w.pullCaptures()
+    const shown = await readSelectedType(w)
+    if (!shown || shown.includes(label)) return 'ok'
+    w.log(`选中验证失败（box 显示「${shown}」≠「${label}」），${attempt === 1 ? '重试一次' : '放弃'}`)
   }
-  return items.length ? items : null
+  return 'verify-failed'
 }
 
-/** DOM 兜底：从 vxe-table 渲染结果提取标准资费行（仅在 API 拦截缺失时使用） */
+/* ---------- 标准资费 DOM 兜底（优先用捕获明文，此路径仅兜底） ---------- */
+
+/** DOM 兜底：从 vxe-table 渲染结果提取标准资费行（宽松选择器：free-cont-box 内任意表格） */
 async function standardItemsFromDom(w) {
   return w.page.evaluate(() => {
-    const boxes = [...document.querySelectorAll('.free-cont-box')]
+    const boxes = [...document.querySelectorAll('.free-cont-box, .freeContent-table')]
     const items = []
     for (const b of boxes) {
-      const trs = [...b.querySelectorAll('.vxe-table--main-wrapper tbody tr')]
-      const ths = [...b.querySelectorAll('.vxe-table--main-wrapper thead th')].map(
-        (th) => (th.innerText || '').trim()
+      const table =
+        b.querySelector('.vxe-table--main-wrapper table') ||
+        b.querySelector('table') ||
+        b.closest('table')
+      if (!table) continue
+      const title = (b.querySelector('.free-cont-title')?.innerText || '').trim() || null
+      const ths = [...table.querySelectorAll('thead th, thead td')].map((th) =>
+        (th.innerText || '').trim()
       )
-      for (const tr of trs) {
+      for (const tr of [...table.querySelectorAll('tbody tr')]) {
         const cells = [...tr.querySelectorAll('td')].map((td) => (td.innerText || '').trim())
         if (!cells.some(Boolean)) continue
         const fields = {}
@@ -448,11 +709,13 @@ async function standardItemsFromDom(w) {
           if (c) fields[ths[i] || `列${i + 1}`] = c
         })
         fields['资费类型'] = '标准资费'
+        if (title) fields['所属表格'] = title
         items.push({
           name: fields['资费名称'] || cells.find(Boolean) || '未命名标准资费',
           fields,
           usage: [],
           gray: {},
+          _sourceType: '标准资费',
         })
       }
     }
@@ -469,55 +732,58 @@ async function saveJson(w, cards, filename) {
 }
 
 /**
- * 唯一阶段：个人资费 / 河北资费 × 全部类型（动态枚举 + 接口齐全性校验）
+ * 唯一阶段：个人资费 / 河北资费 × 全部类型
+ * （动态枚举 + 应用层明文捕获齐全性校验）
  */
 async function phasePersonalHebei(w) {
   w.log('=== PHASE: 个人资费/河北资费 × 全部类型 ===')
   await resetToHebei(w)
   await w.page.evaluate(() => document.querySelectorAll('.range-tab')[1]?.click())
-  await w.jitter(10, 16)
-  await waitIdle(w)
-
-  // 标准资费选项依赖选省后 getStandardlist 响应到位（isShowStandard=true 才会附加到下拉）：
-  // 先等响应（最多 ~50s，WARP 慢出口兜底），再枚举下拉（带 3 次重试）
-  if (!w.api.standard) {
-    w.log('等待 getStandardlist 响应（标准资费选项的附加条件）...')
-    for (let i = 0; i < 12 && !w.api.standard; i++) {
-      await w.jitter(2.5, 4)
-    }
-    w.log(`getStandardlist: ${w.api.standard ? '已捕获' : '未见（该省可能无标准资费或响应超时）'}`)
+  // ★点击页签后立即归属默认类型：页签切换会以当前类型重拉列表（page 1 明文
+  //   ~1s 内到达，须赶在周期拉取器之前定归属，否则被归进「初始加载」空桶）。
+  //   随后读 box 文案校正；即便读出的不是默认值也无碍——主循环处理该类型时
+  //   selectType 会重新触发 page 1 并正确归属
+  w.api.currentType = '套餐'
+  await w.jitter(8, 12)
+  const shownType = await readSelectedType(w)
+  if (shownType && !shownType.includes('套餐')) {
+    w.log(`⚠ 页签切换后选中类型为「${shownType}」（非默认套餐），归属已跟随校正`)
+    w.api.currentType = shownType
+  } else {
+    w.log('类型下拉当前选中（初始归属）：套餐')
   }
+  await waitIdle(w)
+  await w.pullCaptures()
+
+  // 枚举类型下拉（幂等打开；3 次重试）
   let options = []
   for (let i = 0; i < 3; i++) {
     await openTypeDropdown(w)
     options = await listTypeOptions(w)
-    if (options.length > 0 && options.includes('标准资费')) break
-    // 收起下拉（再点一次 box）后稍等重试
-    await w.page.evaluate(() => {
-      const sb = document.querySelector('.select-box')
-      sb?.click()
-    })
+    if (options.length > 0) break
+    await closeTypeDropdown(w)
     await w.jitter(4, 8)
   }
+  await closeTypeDropdown(w) // ★枚举完毕务必收起，保证主循环状态确定
   if (options.length === 0) throw new Error('类型下拉枚举失败（页面结构可能已变化）')
   w.log(`类型下拉选项（${options.length} 个）: ${options.join(' / ')}`)
 
   if (SMOKE) {
-    // 冒烟：验证选项枚举 + 切一个非默认类型 + 卡片选择器 + 接口拦截
+    // 冒烟：验证选项枚举 + 切一个非默认类型 + 选中验证 + 卡片选择器 + 明文捕获
     const probe = options.find((o) => o !== '套餐' && o !== '标准资费') || options[0]
-    await clickTypeOption(w, probe)
-    await w.jitter(8, 14)
+    const sel = probe === '套餐' ? 'skip' : await selectType(w, probe)
     await waitIdle(w)
     await scrollAll(w, 3)
+    await w.pullCaptures()
     const n = await countCards(w)
-    if (probe !== '标准资费' && n === 0 && w.api.standard == null) {
-      throw new Error('SMOKE 未观察到卡片与标准资费数据（选择器或页面结构可能已变化）')
-    }
-    const apiSnapshot = [...w.api.lists.entries()].map(
-      ([k, v]) => `${k} → total=${v.total} beans=${v.beans}`
+    const listTypes = [...w.api.listByType.keys()]
+    w.log(
+      `SMOKE 探测类型「${probe}」: ${n} cards（选中=${sel}）；` +
+        `明文捕获: 列表类型=[${listTypes.join('，')}] 标准资费=${w.api.standardTables ? '已捕获' : '未见'}`
     )
-    w.log(`SMOKE 探测类型「${probe}」: ${n} cards；API 拦截: ${apiSnapshot.join(' ; ') || '（暂无）'}`)
-    w.log(`SMOKE 标准资费数据: ${w.api.standard ? '已捕获' : '未见（该省可能无标准资费或尚未返回）'}`)
+    if (n === 0 && !w.api.standardTables && w.api.listByType.size === 0) {
+      throw new Error('SMOKE 未观察到卡片与任何明文捕获（选择器或页面结构可能已变化）')
+    }
     return 'smoke-ok'
   }
 
@@ -528,61 +794,78 @@ async function phasePersonalHebei(w) {
     if (done.has(label)) continue
     done.add(label)
 
+    /* ---- 标准资费：不走列表 API，数据源 = 捕获明文（全部表格组） ---- */
     if (label === '标准资费') {
-      // 标准资费：点选触发 StandarTariff 表格视图；数据优先取拦截到的 API 原始响应
-      await openTypeDropdown(w)
-      const res = await clickTypeOption(w, label)
-      await w.jitter(8, 14)
-      if (res === 'nf') {
-        w.log(`标准资费: 下拉选项消失（数据可能为空），跳过`)
-        results.push({ label, count: 0, apiTotal: 0, note: '选项不可用' })
-        continue
-      }
-      let items = standardItemsFromApi(w.api.standard)
-      if (!items) {
-        items = await standardItemsFromDom(w)
-        w.log(`标准资费: API 拦截缺失，DOM 兜底提取 ${items.length} 行`)
+      await selectType(w, label)
+      await w.jitter(5, 9)
+      await w.pullCaptures()
+      let items = w.api.standardTables ? standardTablesToItems(w.api.standardTables) : null
+      let note = w.api.standardTables ? `明文 ${w.api.standardTables.length} 表格组` : ''
+      if (!items || items.length === 0) {
+        // 兜底 1：DOM vxe-table
+        const domItems = await standardItemsFromDom(w)
+        if (domItems.length) {
+          items = domItems
+          note = `DOM 兜底 ${domItems.length} 行`
+        } else {
+          // 兜底 2：再等一轮捕获（慢出口）
+          for (let i = 0; i < 6 && !w.api.standardTables; i++) {
+            await w.jitter(3, 5)
+            await w.pullCaptures()
+          }
+          items = w.api.standardTables ? standardTablesToItems(w.api.standardTables) : null
+          if (items && items.length) note = `慢捕获 ${w.api.standardTables.length} 表格组`
+        }
       }
       if (items && items.length) {
         await saveJson(w, items, `p_h_${fileSafe(label)}.json`)
-        results.push({ label, count: items.length, apiTotal: items.length, note: '接口原始数据' })
+        results.push({ label, count: items.length, apiTotal: items.length, note })
       } else {
-        w.log(`标准资费: 无数据行`)
-        results.push({ label, count: 0, apiTotal: 0, note: '无数据行' })
+        // 选项存在却拿不到数据：页面声明有标准资费但捕获/DOM 均空 → 判失败（宁缺毋滥）
+        results.push({ label, count: 0, apiTotal: null, note: '选项存在但明文/DOM 均未取到数据' })
       }
+      await w.jitter(3, 6)
       continue
     }
 
-    // 常规类型：下拉点选 → 等列表加载 → 真人滚动收集
-    await openTypeDropdown(w)
-    const res = await clickTypeOption(w, label)
-    await w.jitter(8, 14)
+    /* ---- 常规列表类型 ---- */
+    // 已选中类型不重复点击（同值选择不触发重载，滚动收集现有列表即可）
+    const already = (await readSelectedType(w)) || ''
+    const sel = already.includes(label) ? 'already' : await selectType(w, label)
     await waitIdle(w)
-    if (res === 'nf') {
+    if (sel === 'nf') {
       w.log(`${label}: 下拉选项消失，跳过`)
       results.push({ label, count: 0, apiTotal: null, note: '选项不可用' })
       continue
     }
+    if (sel === 'verify-failed') {
+      results.push({ label, count: 0, apiTotal: null, note: '选中验证失败' })
+      continue
+    }
+
     let count = await scrollAll(w)
-    if (count === 0) {
-      // 列表级自愈：0 cards（限流/慢批次）——冷却 60~90s 后重选类型重抓一次
+    await w.pullCaptures()
+    let entry = w.api.listByType.get(label)
+    // 接口已声明 0 条的空类型无需重试；其余 0 cards 场景冷却 60~90s 重选重抓一次
+    if (count === 0 && !(entry && entry.total === 0)) {
       w.log(`${label}: 0 cards——冷却后重试一次`)
       await w.jitter(60, 90)
-      await openTypeDropdown(w)
-      const r2 = await clickTypeOption(w, label)
-      await w.jitter(10, 16)
+      await selectType(w, label)
       await waitIdle(w)
-      if (r2 === 'ok') count = await scrollAll(w)
-    }
-    // 接口齐全性自愈：DOM 数 < 接口声明 total → 重滚一轮（在途批次兜底）
-    const type2 = TYPE_VALUE[label]
-    const entry = type2 ? w.api.lists.get(`${SCOPE_KEY}${type2}`) : null
-    const apiTotal = entry ? entry.total : null
-    if (apiTotal != null && count < apiTotal) {
-      w.log(`${label}: DOM ${count} < 接口 total ${apiTotal}——追加一轮滚动自愈`)
       count = await scrollAll(w)
+      await w.pullCaptures()
+      entry = w.api.listByType.get(label)
     }
-    w.log(`${label}: ${count} cards（接口 total=${apiTotal ?? '未知'}）`)
+    // 接口齐全性自愈：DOM 数 < 捕获 total → 追加一轮滚动（在途批次兜底）
+    let apiTotal = entry ? entry.total : null
+    if (apiTotal != null && count < apiTotal) {
+      w.log(`${label}: DOM ${count} < 明文 total ${apiTotal}——追加一轮滚动自愈`)
+      count = await scrollAll(w)
+      await w.pullCaptures()
+      entry = w.api.listByType.get(label)
+      apiTotal = entry ? entry.total : null
+    }
+    w.log(`${label}: ${count} cards（明文 total=${apiTotal ?? '未知'}，beans=${entry ? entry.beans.size : '—'}）`)
     const cards = count > 0 ? await extractCards(w) : null
     if (cards) {
       for (const c of cards) c._sourceType = label
@@ -592,34 +875,73 @@ async function phasePersonalHebei(w) {
     await w.jitter(3, 6) // 类型之间的浏览间歇
   }
 
-  /* ---------- 逆向接口齐全性报告（不齐全即失败，阻断推送） ---------- */
+  w.stopPuller()
+  await w.pullCaptures()
+
+  /* ---------- 应用层捕获齐全性报告（严格门禁，阻断推送） ---------- */
   const report = {
     fetchedAt: new Date().toISOString(),
     scope: '个人 × 河北分省',
+    capture: {
+      mechanism: 'JSON.parse 应用层明文捕获（isWX 通道解密必经点）+ XHR URL 关联',
+      endpoints: Object.fromEntries(w.api.endpoints),
+      otherCaptures: w.api.other,
+      initialType: '套餐',
+    },
     types: results,
-    apiLists: [...w.api.lists.entries()].map(([k, v]) => ({ key: k, ...v })),
-    standardFromApi: !!w.api.standard,
-    typesListFromApi: w.api.typesList ? 'captured' : 'not-seen',
+    listByType: [...w.api.listByType.entries()].map(([label, e]) => ({
+      label,
+      total: e.total,
+      pages: e.pages,
+      maxPageNumber: e.maxPageNumber,
+      beanUnique: e.beans.size,
+      firstBeanKeys: e.firstBeanKeys,
+    })),
+    standardFromApi: !!w.api.standardTables,
+    standardGroups: w.api.standardTables
+      ? w.api.standardTables.map((t) => ({ title: t.title, rows: t.tBody.length }))
+      : null,
   }
   writeFileSync(join(API_DUMP_DIR, 'api-report.json'), JSON.stringify(report, null, 2), 'utf-8')
-  if (w.api.standard) {
-    writeFileSync(join(API_DUMP_DIR, 'standard-raw.json'), JSON.stringify(w.api.standard, null, 2), 'utf-8')
+  // beans 原始数据归档（未来切换「接口直连数据源」的分析素材）
+  for (const [label, e] of w.api.listByType) {
+    if (e.beans.size) {
+      writeFileSync(
+        join(API_DUMP_DIR, `beans-${fileSafe(label)}.json`),
+        JSON.stringify([...e.beans.values()], null, 1),
+        'utf-8'
+      )
+    }
+  }
+  if (w.api.standardTables) {
+    writeFileSync(
+      join(API_DUMP_DIR, 'standard-raw.json'),
+      JSON.stringify(w.api.standardTables, null, 2),
+      'utf-8'
+    )
   }
 
-  tlog('── 逆向接口齐全性报告 ──')
-  let incomplete = 0
+  tlog('── 应用层捕获齐全性报告 ──')
+  tlog(
+    `  捕获通道: ${[...w.api.endpoints.entries()].map(([k, v]) => `${k}×${v}`).join('，') || '（无捕获！）'}`
+  )
+  let failed = 0
   for (const r of results) {
     const flag =
-      r.apiTotal == null
-        ? '⚠ 未核对'
-        : r.count >= r.apiTotal
-          ? '✓ 完整'
-          : `✗ 缺失 ${r.apiTotal - r.count} 条`
-    if (r.apiTotal != null && r.count < r.apiTotal) incomplete++
+      r.count === 0
+        ? r.apiTotal === 0
+          ? '✓ 空类型（接口声明 0 条）'
+          : `✗ FAILED（0 条${r.apiTotal != null ? `，接口声明 ${r.apiTotal} 条` : '，捕获未知'}）`
+        : r.apiTotal == null
+          ? '⚠ 完整（捕获未知，DOM 有数据）'
+          : r.count >= r.apiTotal
+            ? '✓ 完整'
+            : `✗ FAILED（缺 ${r.apiTotal - r.count} 条）`
+    if (flag.includes('✗')) failed++
     tlog(`  ${r.label}: 抓取 ${r.count} / 接口 ${r.apiTotal ?? '—'} ${flag}${r.note ? `（${r.note}）` : ''}`)
   }
-  if (incomplete > 0) {
-    tlog(`=== FAILED：${incomplete} 个类型抓取数低于接口声明总数（宁缺毋滥，阻断当日推送）===`)
+  if (failed > 0) {
+    tlog(`=== FAILED：${failed} 个类型不达标（宁缺毋滥，阻断当日推送）===`)
     process.exitCode = 1
     return
   }
@@ -638,7 +960,8 @@ const TASKS = [{ label: '个人×河北全类型', run: phasePersonalHebei }]
 tlog(
   `启动：模式=${SMOKE ? 'SMOKE（快速冒烟·单 worker）' : 'FULL（个人×河北 × 全部类型）'}，` +
     `任务=${TASKS.map((t) => t.label).join(' / ')}` +
-    (process.env.WARP_SOCKS ? `，代理=${process.env.WARP_SOCKS}` : '，出口=TUN 直连')
+    (process.env.WARP_SOCKS ? `，代理=${process.env.WARP_SOCKS}` : '，出口=TUN 直连') +
+    (process.env.SCRAPE_URL ? `，目标=${URL}` : '')
 )
 
 /* ---------- worker pool（当前单阶段=单 worker） ---------- */
@@ -655,14 +978,19 @@ const settled = await Promise.allSettled([
         if (idx > 0) await w.jitter(8, 15)
         const r = await task.run(w)
         if (SMOKE && r === 'smoke-ok') {
-          w.log('SMOKE 通过 ✓ 导航 + 河北选择 + 页签切换 + 类型下拉枚举 + 滚动 + 接口拦截全部健康')
+          w.log(
+            'SMOKE 通过 ✓ 导航 + 河北选择 + 页签切换 + 类型下拉枚举/幂等 + 明文捕获通道全部健康'
+          )
+          w.stopPuller()
           await w.context.close()
           return 'smoke-ok'
         }
         await w.jitter(6, 12)
       }
+      w.stopPuller()
       await w.context.close()
     } catch (e) {
+      w.stopPuller()
       await w.context.close().catch(() => {})
       throw e
     }

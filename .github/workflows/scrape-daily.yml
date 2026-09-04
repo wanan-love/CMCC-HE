@@ -159,14 +159,15 @@ jobs:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: node scripts/push-sync.mjs
 
-      # 每日快照归档（免费 artifact 保留 90 天，作为数据备份/审计线索；含逆向接口齐全性报告）
+      # 每日快照归档（免费 artifact 保留 90 天，作为数据备份/审计线索；
+      # 含应用层捕获齐全性报告 + beans/标准资费明文 dump）
       - name: Upload snapshot artifact
         uses: actions/upload-artifact@v4
         with:
           name: tariffs-${{ github.run_number }}
           path: |
             seed/tariffs.normalized.json
-            seed/api/api-report.json
+            seed/api/
           retention-days: 90
           if-no-files-found: warn
 

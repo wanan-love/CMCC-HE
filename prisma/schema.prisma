@@ -32,6 +32,7 @@ model Tariff {
   usageJson   String // 套餐内容 JSON [{label,value}]
   extraJson   String // 其他说明 JSON {超出资费说明,其他服务内容,其他说明}
   contentHash String // 内容哈希，用于变更检测
+  missCount   Int      @default(0) // 连续未抓到次数（REMOVED 二次确认：连续 2 次未见才判下线，防假下线）
   firstSeenAt DateTime // 首次发现（历史重构=上线日期）
   lastSeenAt  DateTime // 最后确认在线
   status      String // ONLINE / OFFLINE

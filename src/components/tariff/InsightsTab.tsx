@@ -18,7 +18,9 @@ import {
   Cell,
   CartesianGrid,
 } from 'recharts'
-import { useInsights } from './api'
+import { useInsights, useSyncRuns } from './api'
+import { formatDateTimeCN, formatRelativeTime } from '@/lib/relative-time'
+import { Badge } from '@/components/ui/badge'
 
 const PIE_COLORS = ['#059669', '#0d9488', '#d97706', '#db2777', '#0891b2', '#78716c', '#a16207']
 
@@ -186,6 +188,7 @@ const INSIGHT_SECTIONS: { id: string; label: string; core?: boolean }[] = [
   { id: 'ins-planprice', label: '套餐价格', core: true },
   { id: 'ins-addonprice', label: '加装包价格' },
   { id: 'ins-year', label: '年度', core: true },
+  { id: 'ins-synchealth', label: '同步健康', core: true },
 ]
 
 function InsightsNav({ sections }: { sections: { id: string; label: string; core?: boolean }[] }) {
@@ -549,8 +552,99 @@ export function InsightsTab({
           </BarChart>
         </ResponsiveContainer>
       </ChartCard>
+
+      {/* 数据同步健康（采集链路可见性：每日 04:00 抓取 → 同步差异一目了然） */}
+      <SyncHealthCard />
       </div>
     </div>
+  )
+}
+
+/** 数据同步健康卡：最近同步运行记录（日期 / ±数量 / 结果 / 说明）。
+ *  背景：2026-09-04 事故（采集漏抓套餐→502 条被误判下线）后新增——
+ *  同步差异是采集链路的健康信号，异常（如大规模下线）在此一目了然。
+ *  下线采用「二次确认」：单次未见仅计数不判下线，连续 2 个快照日未见才真下线。 */
+function SyncHealthCard() {
+  const { data, isLoading } = useSyncRuns()
+  const runs = (data?.runs || []).slice(0, 8)
+
+  return (
+    <Card id="ins-synchealth" className="lg:col-span-2 scroll-mt-24 border-stone-200">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm flex items-center gap-2">
+          数据同步健康
+          <Badge variant="outline" className="text-[10px] font-normal text-stone-500 border-stone-200">
+            每日 04:00 抓取
+          </Badge>
+        </CardTitle>
+        <p className="text-[11px] text-stone-400 leading-relaxed">
+          采集（GitHub Actions）→ 同步差异 → 本站。下线采用二次确认（连续 2 个快照日未见才判下线），大规模下线/上线会在此直观呈现。
+        </p>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <div className="space-y-2">
+            {[0, 1, 2].map((i) => (
+              <Skeleton key={i} className="h-10 w-full rounded-md" />
+            ))}
+          </div>
+        ) : runs.length === 0 ? (
+          <p className="text-xs text-stone-400 py-4 text-center">暂无同步记录</p>
+        ) : (
+          <div className="max-h-72 overflow-y-auto custom-scrollbar -mr-2 pr-2">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-stone-400 border-b border-stone-100">
+                  <th className="text-left font-normal py-1.5 pr-2">时间</th>
+                  <th className="text-left font-normal px-2">状态</th>
+                  <th className="text-right font-normal px-2 whitespace-nowrap">上线 / 下线 / 变更</th>
+                  <th className="text-right font-normal pl-2">在售</th>
+                  <th className="text-left font-normal pl-3 hidden sm:table-cell">说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {runs.map((r) => (
+                  <tr
+                    key={r.id}
+                    className="border-b border-stone-50 last:border-0 hover:bg-stone-50/60 transition-colors"
+                    title={r.message || ''}
+                  >
+                    <td className="py-1.5 pr-2 whitespace-nowrap text-stone-600" title={formatDateTimeCN(r.startedAt)}>
+                      {r.date}
+                      <span className="text-stone-400 ml-1">{formatRelativeTime(r.startedAt)}</span>
+                    </td>
+                    <td className="px-2">
+                      {r.status === 'SUCCESS' ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-700">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />成功
+                        </span>
+                      ) : r.status === 'RUNNING' ? (
+                        <span className="inline-flex items-center gap-1 text-teal-700">
+                          <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-pulse" />运行中
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-red-700">
+                          <span className="w-1.5 h-1.5 rounded-full bg-red-500" />失败
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-2 text-right whitespace-nowrap font-mono">
+                      <span className={r.added > 0 ? 'text-emerald-600' : 'text-stone-300'}>+{r.added}</span>
+                      <span className="text-stone-300 mx-1">/</span>
+                      <span className={r.removed > 0 ? 'text-red-600' : 'text-stone-300'}>-{r.removed}</span>
+                      <span className="text-stone-300 mx-1">/</span>
+                      <span className={r.updated > 0 ? 'text-amber-600' : 'text-stone-300'}>~{r.updated}</span>
+                    </td>
+                    <td className="pl-2 text-right text-stone-600 font-mono">{r.totalAfter || '—'}</td>
+                    <td className="pl-3 text-stone-500 max-w-md truncate hidden sm:table-cell">{r.message || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 

@@ -164,6 +164,22 @@ export async function POST(req: NextRequest) {
       if (!v.ok) throw new Error(v.error || 'items 校验失败')
       incoming = v.data!
       source = 'scraper'
+      // 分类归零闸门：线上某分类在线 >= MIN_GUARD 条而本次抓取该分类为 0 ——
+      // 疑似采集端漏抓整类（2026-09-04 事故模式），拒绝本次同步（宁缺毋滥）
+      const prevCats = await db.tariff.groupBy({
+        by: ['category'],
+        where: { status: 'ONLINE' },
+        _count: { _all: true },
+      })
+      const incCats = new Set(incoming.map((t) => t.category))
+      for (const g of prevCats) {
+        const c = g._count._all
+        if (c >= 20 && !incCats.has(g.category)) {
+          throw new Error(
+            `分类归零闸门：分类「${g.category}」线上在售 ${c} 条但本次抓取为 0，疑似漏抓，已拒绝本次同步`
+          )
+        }
+      }
     } else {
       if (!existsSync(SEED_FILE)) {
         throw new Error('未找到种子数据文件，请先运行抓取脚本')
@@ -184,7 +200,9 @@ export async function POST(req: NextRequest) {
         added: result.added,
         removed: result.removed,
         updated: result.updated,
-        message: `同步完成：抓取 ${incoming.length} 条（+${result.added} / -${result.removed} / ~${result.updated}）`,
+        message:
+          `同步完成：抓取 ${incoming.length} 条（+${result.added} / -${result.removed} / ~${result.updated}）` +
+          (result.pendingMiss > 0 ? `；${result.pendingMiss} 条连续未见到待二次确认` : ''),
       },
     })
 
@@ -200,6 +218,9 @@ export async function POST(req: NextRequest) {
   }
 }
 
+/** REMOVED 二次确认阈值：连续 N 次同步未见才判下线 */
+const REMOVED_MISS_THRESHOLD = 2
+
 /**
  * 差异同步引擎：incoming vs 数据库当前状态
  *
@@ -208,6 +229,12 @@ export async function POST(req: NextRequest) {
  *  2. 「无变化」的资费不逐行刷 lastSeenAt —— 避免每天 3100+ 行写入；
  *     lastSeenAt 语义 =「内容最后一次确认」，仅真实变更时刷新（每天通常 0~50 行写）
  *  3. 事件、资费变更攒批后 createMany/updateMany 单事务提交（1 次往返）
+ *
+ * REMOVED 二次确认（2026-09-04 事故后新增）：
+ *  数据库有、本次抓取没有的在线资费：missCount+1；达到阈值（连续 2 次）才
+ *  OFFLINE + REMOVED 事件，否则保持 ONLINE 仅累加计数（无事件、无状态变化）。
+ *  防单次抓取缺失（漏抓/限流/批次在途）→ 假下线事件污染时间轴。
+ *  代价：真实下线的确认延迟 1 天（下线预告由 offlineDate 提前预警，不受影响）。
  */
 async function runDiffSync(incoming: IncomingTariff[]) {
   const today = new Date().toISOString().slice(0, 10)
@@ -232,6 +259,7 @@ async function runDiffSync(incoming: IncomingTariff[]) {
       extraJson: true,
       contentHash: true,
       status: true,
+      missCount: true,
     },
   })
   const byCode = new Map(existing.map((t) => [t.code, t]))
@@ -327,6 +355,7 @@ async function runDiffSync(incoming: IncomingTariff[]) {
         data: {
           status: 'ONLINE',
           removedAt: null,
+          missCount: 0,
           lastSeenAt: now,
           contentHash: t.contentHash,
           name: t.name,
@@ -386,6 +415,7 @@ async function runDiffSync(incoming: IncomingTariff[]) {
             usageJson: t.usageJson,
             extraJson: t.extraJson,
             contentHash: t.contentHash,
+            missCount: 0,
             lastSeenAt: now,
           },
         })
@@ -401,24 +431,39 @@ async function runDiffSync(incoming: IncomingTariff[]) {
         })
       }
     }
-    // 无变化：跳过写入（D1 行写优化），lastSeenAt 语义为「内容最后确认」
+    // 内容无变化但此前有 miss（曾连续未见到）：归零计数，无事件（仅计数写）
+    if (
+      cur &&
+      cur.status === 'ONLINE' &&
+      cur.contentHash === t.contentHash &&
+      (cur.missCount ?? 0) > 0
+    ) {
+      toUpdate.push({ code: t.code, data: { missCount: 0 } })
+    }
   }
 
-  // 下线检测：数据库有但本次抓取没有的
+  // 下线检测（二次确认）：数据库有但本次抓取没有的 → missCount+1；
+  // 连续达到阈值才 OFFLINE + REMOVED 事件，否则保持 ONLINE 仅累加计数
   const incomingCodes = new Set(incoming.map((t) => t.code))
   const toOffline: string[] = []
+  const toMiss: { code: string; missCount: number }[] = []
   for (const cur of existing) {
     if (!incomingCodes.has(cur.code) && cur.status === 'ONLINE') {
-      toOffline.push(cur.code)
-      offEvents.push({
-        date: today,
-        type: 'REMOVED',
-        source: 'sync',
-        tariffCode: cur.code,
-        tariffName: cur.name,
-        category: cur.category,
-        summary: `「${cur.name}」已从公示页下线`,
-      })
+      const miss = (cur.missCount ?? 0) + 1
+      if (miss >= REMOVED_MISS_THRESHOLD) {
+        toOffline.push(cur.code)
+        offEvents.push({
+          date: today,
+          type: 'REMOVED',
+          source: 'sync',
+          tariffCode: cur.code,
+          tariffName: cur.name,
+          category: cur.category,
+          summary: `「${cur.name}」已从公示页下线（连续 ${miss} 个快照日未见）`,
+        })
+      } else {
+        toMiss.push({ code: cur.code, missCount: miss })
+      }
     }
   }
 
@@ -434,8 +479,11 @@ async function runDiffSync(incoming: IncomingTariff[]) {
   if (toOffline.length) {
     await db.tariff.updateMany({
       where: { code: { in: toOffline } },
-      data: { status: 'OFFLINE', removedAt: now },
+      data: { status: 'OFFLINE', removedAt: now, missCount: 0 },
     })
+  }
+  for (const m of toMiss) {
+    await db.tariff.update({ where: { code: m.code }, data: { missCount: m.missCount } })
   }
   const allEvents = [...addEvents, ...updateEvents, ...offEvents]
   for (let i = 0; i < allEvents.length; i += BATCH) {
@@ -446,5 +494,5 @@ async function runDiffSync(incoming: IncomingTariff[]) {
   updated = updateEvents.length
   removed = offEvents.length
 
-  return { added, removed, updated }
+  return { added, removed, updated, pendingMiss: toMiss.length }
 }

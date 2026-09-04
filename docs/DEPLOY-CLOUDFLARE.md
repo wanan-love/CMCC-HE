@@ -22,20 +22,38 @@
 | 接口 | 请求 | 响应要点 |
 |---|---|---|
 | `/website/nrapigate/nrtariff/new/Tariff/getTariffListInfo` | `{cellNum:'99999999999', province:'311', isPublic:'1', linkScn:'1', tariffAttr:'1'全网/'2'分省, type1:'1'个人/'2'政企, type2:'1'~'7', page, limit:5}` | `rspBody.(data?).{page:{total}, beans:[卡片数据]}` |
-| `/website/nrapigate/nrtariff/new/Tariff/getStandardlist` | `{province:'311', isPublic:'1'}` | `rspBody[0].tariffTable` 或 `rspBody.tariffList[0].tariffTable` = `{tHead, tBody}` |
+| `/website/nrapigate/nrtariff/new/Tariff/getStandardlist` | `{province:'311', isPublic:'1'}` | `rspBody[0].tariffTable` 或 `rspBody.tariffList[0].tariffTable` = `{tHead, tBody}`（**官方页面只用第一组表格；采集端全量提取所有组**） |
 | `/website/nrapigate/nrtariff/new/Tariff/getType2List` | 同上省参数 | 当前（type1×tariffAttr）可用的类型清单 |
+
+**★ isWX 加密通道（2026-09-04 二次逆向，v4 关键发现）：** 上述接口全部走加密通道——
+请求体经 `ff()` 加密后发出，网络层响应是 `{body:'<密文>'}` 信封，在 axios 响应拦截器内
+经 `F6()` 解密后 `JSON.parse` 才得到业务明文（chunk-common.js 响应拦截器实证）。因此：
+- **网络层拦截（page.on('response')）永远拿不到 page.total/beans/表格**——v3 的
+  「接口 total=未知 ⚠ 未核对」齐全性闸门因此形同虚设（事故根因之一）；
+- v4 改用 **应用层捕获**：addInitScript 在页面 JS 之前 hook 全局 `JSON.parse`（解密
+  明文必经之路）+ 包装 XHR `onreadystatechange`（axios 绑定方式）关联请求 URL，
+  实现端点级明文捕获；数据本身仍以 DOM 卡片为主源（捕获的 beans 归档备未来直连）。
 
 **类型值映射（chunk-155 内硬编码）：** 1 套餐 / 2 加装包 / 3 营销活动 / 4 港澳台/国际资费 /
 5 标准资费（下拉里是特殊值 `标准资费VALUE`，仅分省页签且标准数据存在时出现，**不走列表 API**，
 数据在选省时由 getStandardlist 拉取）/ 6 国际及港澳台标准资费 / 7 其他。
 河北省份编码 `311`（URL 里的 `prov=531` 是山东，页面加载后需手动切省）。
 
-**齐全性校验（scrape.mjs 内置）：** Playwright `page.on('response')` 拦截以上 XHR——
-以接口声明的 `page.total` 逐一核对每类型实际抓到的 DOM 卡片数（DOM 即 beans 渲染结果）；
-标准资费直接消费 getStandardlist 原始表格 JSON（tHead/tBody → 卡片字段，无方案编号的行合成
-`STD-<md5(名称)>` 稳定编号，内容变化=同编号 contentHash 变化=UPDATED 事件）。
-任一类型不齐全 → 自愈重抓一次 → 仍不足则脚本非零退出，workflow 中止（不推送，杜绝漏抓上线）。
-报告落盘 `seed/api/api-report.json` 随 artifact 归档。
+**齐全性校验（scrape.mjs v4 内置，严格门禁）：** 应用层捕获的明文 `page.total` 逐一核对
+每类型实际抓到的 DOM 卡片数（DOM 即 beans 渲染结果）；标准资费直接消费 getStandardlist
+解密明文的【全部表格组】（tHead/tBody → 卡片字段，无方案编号的行合成 `STD-<md5(名称)>`
+稳定编号，内容变化=同编号 contentHash 变化=UPDATED 事件）。门禁规则（宁缺毋滥）：
+- 类型选项在下拉中存在 ⇒ 必须有数据：count==0 且 apiTotal≠0（含未知）即 FAILED——
+  2026-09-04 事故（套餐被下拉切换 bug 跳过 → 0 条照常推送 → 502 条全部误判下线）根因修复；
+- count>0 且 apiTotal 已知 ⇒ 必须 count ≥ apiTotal（自愈重滚后仍不足即 FAILED）；
+- 任一 FAILED → 脚本非零退出 → workflow 中止（不推送）。
+报告与 beans/标准资费明文落盘 `seed/api/` 随 artifact 归档。
+
+**推送侧双闸门（push-sync.mjs + 同步 API）：**
+- 数量闸门：本次抓取数 < 线上在售 × 0.8 时中止（防懒加载截断型漏抓）；
+- 分类归零闸门（同步 API 服务端）：线上某分类在线 ≥ 20 条而本次抓取该分类为 0 → 拒绝同步；
+- REMOVED 二次确认（同步引擎）：在线但本次未抓到 → missCount+1，连续 2 个快照日未见才
+  判下线 + REMOVED 事件；单次缺失保持 ONLINE 不产生事件（杜绝假下线污染时间轴）。
 
 ## 一、架构总览
 

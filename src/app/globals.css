@@ -144,4 +144,19 @@
   .no-scrollbar::-webkit-scrollbar {
     display: none;
   }
+  /* 显式细滚动条（长列表容器：同步健康卡等；与全局一致但语义化、hover 加深） */
+  .custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: oklch(0.75 0.01 100 / 0.7) transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 5px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: oklch(0.75 0.01 100 / 0.7);
+    border-radius: 3px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: oklch(0.6 0.01 100 / 0.85);
+  }
 }

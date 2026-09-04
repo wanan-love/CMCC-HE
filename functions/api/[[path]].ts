@@ -1273,11 +1273,18 @@ const EVENT_INSERT_SQL = `INSERT INTO ChangeEvent
 const updateSql = (sets: string[], code: string) =>
   `UPDATE Tariff SET ${sets.join(', ')} WHERE code = ${JSON.stringify(code)}`
 
+/** REMOVED 二次确认阈值：连续 N 次同步未见才判下线 */
+const REMOVED_MISS_THRESHOLD = 2
+
 /**
  * 差异同步引擎（D1 版）——与沙箱版语义一致 + 首灌历史重构：
  *  1. 全表读一次 diff 所需列；「无变化不写」；批量事务提交（每批 ≤400 语句，单语句参数 ≤100）
  *  2. 新增资费除「今日 ADDED(sync)」外，若带有效上线日期（≤今日）同时生成「ADDED(history)」事件
  *     并回填 firstSeenAt —— 复刻 seed-db 的历史重构，Action 首灌即拥有完整时间轴纵深
+ *  3. REMOVED 二次确认（2026-09-04 事故后新增）：在线但本次未抓到 → missCount+1，
+ *     连续达到阈值（2）才 OFFLINE + REMOVED 事件；单次缺失仅累加计数保持 ONLINE，
+ *     防单次抓取缺失（漏抓/限流/批次在途）→ 假下线事件污染时间轴。
+ *     代价：真实下线确认延迟 1 天（下线预告由 offlineDate 提前预警，不受影响）。
  */
 async function runDiffSync(env: Env, incoming: IncomingTariff[], runId: string) {
   const today = todayStr()
@@ -1285,7 +1292,7 @@ async function runDiffSync(env: Env, incoming: IncomingTariff[], runId: string) 
 
   const existing = await env.DB.prepare(
     `SELECT code, name, category, price, priceValue, onlineDate, offlineDate, target, channels,
-            effective, requirement, unsubscribe, liability, usageJson, extraJson, contentHash, status
+            effective, requirement, unsubscribe, liability, usageJson, extraJson, contentHash, status, missCount
      FROM Tariff`
   ).all<{
     code: string
@@ -1305,6 +1312,7 @@ async function runDiffSync(env: Env, incoming: IncomingTariff[], runId: string) 
     extraJson: string
     contentHash: string
     status: string
+    missCount: number
   }>()
   const byCode = new Map(existing.results.map((t) => [t.code, t]))
 
@@ -1341,6 +1349,7 @@ async function runDiffSync(env: Env, incoming: IncomingTariff[], runId: string) 
   let added = 0
   let removed = 0
   let updated = 0
+  let pendingMiss = 0
 
   for (const t of incoming) {
     const cur = byCode.get(t.code)
@@ -1405,6 +1414,7 @@ async function runDiffSync(env: Env, incoming: IncomingTariff[], runId: string) 
             [
               'status = ?',
               'removedAt = NULL',
+              'missCount = 0',
               'lastSeenAt = ?',
               'contentHash = ?',
               'name = ?',
@@ -1469,6 +1479,7 @@ async function runDiffSync(env: Env, incoming: IncomingTariff[], runId: string) 
                 'usageJson = ?',
                 'extraJson = ?',
                 'contentHash = ?',
+                'missCount = 0',
                 'lastSeenAt = ?',
               ],
               t.code
@@ -1504,24 +1515,43 @@ async function runDiffSync(env: Env, incoming: IncomingTariff[], runId: string) 
         })
       }
     }
-    // 无变化：跳过写入（D1 行写优化），lastSeenAt 语义 =「内容最后确认」
+    // 内容无变化但此前有 miss（曾连续未见到）：归零计数，无事件（仅计数写）
+    if (cur && cur.status === 'ONLINE' && cur.contentHash === t.contentHash && (cur.missCount ?? 0) > 0) {
+      stmts.push(env.DB.prepare(updateSql(['missCount = 0'], t.code)))
+    }
+    // 无变化：跳过其余写入（D1 行写优化），lastSeenAt 语义 =「内容最后确认」
   }
 
-  // 下线检测：数据库有但本次抓取没有的
+  // 下线检测（二次确认）：数据库有但本次抓取没有的 → missCount+1；
+  // 连续达到阈值才 OFFLINE + REMOVED 事件，否则保持 ONLINE 仅累加计数（无事件）
   const incomingCodes = new Set(incoming.map((t) => t.code))
   for (const cur of existing.results) {
     if (!incomingCodes.has(cur.code) && cur.status === 'ONLINE') {
-      stmts.push(env.DB.prepare(updateSql(['status = ?', 'removedAt = ?'], cur.code)).bind('OFFLINE', now))
-      removed++
-      addEvent({
-        date: today,
-        type: 'REMOVED',
-        source: 'sync',
-        tariffCode: cur.code,
-        tariffName: cur.name,
-        category: cur.category,
-        summary: `「${cur.name}」已从公示页下线`,
-      })
+      const miss = (cur.missCount ?? 0) + 1
+      if (miss >= REMOVED_MISS_THRESHOLD) {
+        stmts.push(
+          env.DB.prepare(updateSql(['status = ?', 'removedAt = ?', 'missCount = 0'], cur.code)).bind(
+            'OFFLINE',
+            now
+          )
+        )
+        removed++
+        addEvent({
+          date: today,
+          type: 'REMOVED',
+          source: 'sync',
+          tariffCode: cur.code,
+          tariffName: cur.name,
+          category: cur.category,
+          summary: `「${cur.name}」已从公示页下线（连续 ${miss} 个快照日未见）`,
+        })
+      } else {
+        // 单次未见：仅累加计数，保持 ONLINE，不产生事件
+        stmts.push(
+          env.DB.prepare(updateSql(['missCount = ?'], cur.code)).bind(miss)
+        )
+        pendingMiss++
+      }
     }
   }
 
@@ -1531,7 +1561,7 @@ async function runDiffSync(env: Env, incoming: IncomingTariff[], runId: string) 
     await env.DB.batch(stmts.slice(i, i + BATCH))
   }
 
-  return { added, removed, updated }
+  return { added, removed, updated, pendingMiss }
 }
 
 /** POST /api/sync */
@@ -1558,6 +1588,22 @@ async function handleSyncPost(env: Env, request: Request) {
     if (!v.ok) throw new Error(v.error || 'items 校验失败')
     const incoming = v.data!
 
+    // 分类归零闸门：线上某分类在线 ≥ 20 条而本次抓取该分类为 0 —— 疑似采集端
+    // 漏抓整类（2026-09-04 事故模式），拒绝本次同步（宁缺毋滥）
+    {
+      const prevCats = await env.DB.prepare(
+        `SELECT category, COUNT(*) AS c FROM Tariff WHERE status = 'ONLINE' GROUP BY category`
+      ).all<{ category: string; c: number }>()
+      const incCats = new Set(incoming.map((t) => t.category))
+      for (const g of prevCats.results || []) {
+        if (g.c >= 20 && !incCats.has(g.category)) {
+          throw new Error(
+            `分类归零闸门：分类「${g.category}」线上在售 ${g.c} 条但本次抓取为 0，疑似漏抓，已拒绝本次同步`
+          )
+        }
+      }
+    }
+
     const result = await runDiffSync(env, incoming, runId)
 
     const totalAfter = await env.DB.prepare(`SELECT COUNT(*) AS c FROM Tariff WHERE status = 'ONLINE'`).first<{
@@ -1574,7 +1620,8 @@ async function handleSyncPost(env: Env, request: Request) {
         result.added,
         result.removed,
         result.updated,
-        `同步完成：抓取 ${incoming.length} 条（+${result.added} / -${result.removed} / ~${result.updated}）`,
+        `同步完成：抓取 ${incoming.length} 条（+${result.added} / -${result.removed} / ~${result.updated}）` +
+          (result.pendingMiss > 0 ? `；${result.pendingMiss} 条连续未见待二次确认` : ''),
         runId
       )
       .run()
