@@ -1,7 +1,11 @@
 # 每日资费抓取 → 归一化 → 加密推送（Cloudflare Workers 做不了浏览器渲染抓取，故用 GitHub Actions）
 #
 # 触发：每日 UTC 20:00（北京时间 04:00）+ 手动 workflow_dispatch
-# 采集范围：仅「个人资费 × 河北省专属」（不做全网业务与政企业务，单列表约 3~8 分钟）
+# 采集范围：仅「个人资费 × 河北省专属」×【全部资费类型】——
+#   套餐/加装包/营销活动/港澳台(国际)资费/标准资费（类型下拉运行时动态枚举，
+#   页面新增类型自动覆盖）；单类型列表约 1~13 分钟，全类型合计约 10~25 分钟
+# 齐全性校验：scrape.mjs 拦截页面逆向接口（getTariffListInfo 的 page.total /
+#   getStandardlist 原始表格），逐类型比对实际抓取数，不齐全即失败阻断推送
 # 采集出口（三级尝试）：
 #   1. warp-cli TUN 模式（60s 快试；GitHub runner 实测数据面大概率不通，仅环境兜底）
 #   2. docker 容器化 WARP（caomingjun/warp，socks5://127.0.0.1:1080）——runner 上实测唯一稳定路径
@@ -33,8 +37,8 @@ env:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # WARP 安装/连接约 3~8 分钟 + 单阶段真人节奏抓取 3~8 分钟 + 推送重试缓冲
-    timeout-minutes: 30
+    # WARP 安装/连接约 3~8 分钟 + 全类型真人节奏抓取 10~25 分钟 + 推送重试缓冲
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -133,8 +137,8 @@ jobs:
             direct)       curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc|colo)=' || true ;;
           esac
 
-      # ---------- 抓取（WARP 出口 + 真人节奏） ----------
-      - name: Scrape 公示页（个人×河北单阶段，真人节奏）
+      # ---------- 抓取（WARP 出口 + 真人节奏 + 逆向接口齐全性校验） ----------
+      - name: Scrape 公示页（个人×河北全类型，真人节奏 + 接口齐全性闸门）
         run: node scripts/scrape.mjs
 
       - name: Normalize 归一化
@@ -155,13 +159,16 @@ jobs:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: node scripts/push-sync.mjs
 
-      # 每日快照归档（免费 artifact 保留 90 天，作为数据备份/审计线索）
+      # 每日快照归档（免费 artifact 保留 90 天，作为数据备份/审计线索；含逆向接口齐全性报告）
       - name: Upload snapshot artifact
         uses: actions/upload-artifact@v4
         with:
           name: tariffs-${{ github.run_number }}
-          path: seed/tariffs.normalized.json
+          path: |
+            seed/tariffs.normalized.json
+            seed/api/api-report.json
           retention-days: 90
+          if-no-files-found: warn
 
       # ---------- 清理 ----------
       - name: Disconnect WARP（清理）

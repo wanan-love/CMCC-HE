@@ -108,12 +108,30 @@ export interface ApiResponse<T> {
   error?: string
 }
 
+/**
+ * 资费类型全集（逆向自公示页 chunk-155 类型下拉硬编码 + 河北「标准资费」选项）：
+ * 页面实际提供的选项由 getType2List 接口动态返回，此处为并集兜底。
+ */
+export const ALL_CATEGORIES = [
+  '套餐',
+  '加装包',
+  '营销活动',
+  '港澳台/国际资费',
+  '标准资费',
+  '国际及港澳台标准资费',
+  '其他',
+] as const
+
+export type TariffCategory = (typeof ALL_CATEGORIES)[number]
+
 export const CATEGORY_COLORS: Record<string, string> = {
   套餐: 'bg-amber-100 text-amber-800 border-amber-200',
   加装包: 'bg-teal-100 text-teal-800 border-teal-200',
   营销活动: 'bg-pink-100 text-pink-800 border-pink-200',
-  港澳台国际: 'bg-cyan-100 text-cyan-800 border-cyan-200',
   '港澳台/国际资费': 'bg-cyan-100 text-cyan-800 border-cyan-200',
+  港澳台国际: 'bg-cyan-100 text-cyan-800 border-cyan-200',
+  标准资费: 'bg-orange-100 text-orange-800 border-orange-200',
+  国际及港澳台标准资费: 'bg-fuchsia-100 text-fuchsia-800 border-fuchsia-200',
   其他: 'bg-stone-100 text-stone-700 border-stone-200',
 }
 

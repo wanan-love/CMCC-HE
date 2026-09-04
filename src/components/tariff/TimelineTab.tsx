@@ -21,6 +21,7 @@ import { subscribeUrl, updateUrlParam, getMonthFromUrl, getYearFromUrl, getDateF
 import {
   TYPE_META,
   CATEGORY_COLORS,
+  ALL_CATEGORIES,
   SOURCE_LABELS,
   formatDateCN,
   type ChangeEventItem,
@@ -39,7 +40,7 @@ const HEAT_RANGES = [
   { value: 365, label: '一年' },
 ]
 
-const CATEGORIES = ['套餐', '加装包', '营销活动', '港澳台/国际资费']
+const CATEGORIES = [...ALL_CATEGORIES]
 const TYPES = [
   { value: 'ADDED', label: '上线' },
   { value: 'REMOVED', label: '下线' },

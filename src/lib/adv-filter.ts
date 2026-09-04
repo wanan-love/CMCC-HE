@@ -3,15 +3,10 @@
  * 查询参数：catIn（仅看类型，逗号分隔）、catOut（排除类型）、content（套餐内容包含）、priceMin/priceMax
  */
 import type { URLSearchParams } from 'url'
+import { ALL_CATEGORIES } from '@/components/tariff/types'
 
-/** 允许参与筛选的合法分类（含抓取历史中两种写法） */
-export const FILTER_CATEGORIES = [
-  '套餐',
-  '加装包',
-  '营销活动',
-  '港澳台/国际资费',
-  '港澳台国际',
-]
+/** 允许参与筛选的合法分类（全集来自页面类型下拉逆向 + 历史两种写法兜底） */
+export const FILTER_CATEGORIES = [...ALL_CATEGORIES, '港澳台国际']
 
 /** 空集哨兵：in 列表为空时保证「无结果」而非「无条件」 */
 const NONE_SENTINEL = '__none__'

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Download, MousePointerClick } from 'lucide-react'
@@ -21,6 +21,25 @@ import {
 import { useInsights } from './api'
 
 const PIE_COLORS = ['#059669', '#0d9488', '#d97706', '#db2777', '#0891b2', '#78716c', '#a16207']
+
+/** 分类 → 堆积图固定色（全类型覆盖；与 CATEGORY_COLORS 色系对齐，不含蓝/靓蓝） */
+const CATEGORY_HEX: Record<string, string> = {
+  套餐: '#059669',
+  加装包: '#0d9488',
+  营销活动: '#d97706',
+  '港澳台/国际资费': '#db2777',
+  标准资费: '#ea580c',
+  国际及港澳台标准资费: '#c026d3',
+  其他: '#78716c',
+  港澳台国际: '#0891b2',
+}
+/** 图例/提示框里的分类短名（过长的港澳台系简化） */
+const shortCat = (c: string) =>
+  c === '港澳台/国际资费' || c === '港澳台国际'
+    ? '港澳台/国际'
+    : c === '国际及港澳台标准资费'
+      ? '国际及港澳台标准'
+      : c
 
 const fieldLabels: Record<string, string> = {
   name: '分类',
@@ -248,6 +267,22 @@ export function InsightsTab({
 }) {
   const { data, isLoading } = useInsights()
 
+  /** 堆积图的分类系列：数据里实际出现且有数值的分类键（month 之外），按全集顺序稳定排序 */
+  const catKeys = useMemo(() => {
+    const order = [...Object.keys(CATEGORY_HEX)]
+    const seen = new Set<string>()
+    for (const row of data?.categoryMonthly ?? []) {
+      for (const [k, v] of Object.entries(row)) {
+        if (k !== 'month' && Number(v) > 0) seen.add(k)
+      }
+    }
+    return [...seen].sort((a, b) => {
+      const ia = order.indexOf(a)
+      const ib = order.indexOf(b)
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib)
+    })
+  }, [data?.categoryMonthly])
+
   /** 柱形单击下钻：Bar 级 onClick 直接携带该柱的 payload（month 字段） */
   const handleBarClick = (data: unknown) => {
     const payload = (data as { payload?: { month?: unknown } } | null)?.payload
@@ -384,26 +419,24 @@ export function InsightsTab({
             />
             <YAxis tick={{ fontSize: 10, fill: '#78716c' }} width={36} allowDecimals={false} />
             <Tooltip
-              formatter={(v: number, n: string) => [`${v} 个`, n === '港澳台/国际资费' ? '港澳台/国际' : n]}
+              formatter={(v: number, n: string) => [`${v} 个`, shortCat(n)]}
               labelFormatter={(l: string) => `${l}`}
               contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e7e5e4' }}
             />
-            <Legend
-              formatter={(v: string) => (v === '港澳台/国际资费' ? '港澳台/国际' : v)}
-              wrapperStyle={{ fontSize: 11 }}
-            />
-            <Bar dataKey="套餐" stackId="cat" name="套餐" fill="#059669" maxBarSize={32} className="cursor-pointer" onClick={handleBarClick} />
-            <Bar dataKey="加装包" stackId="cat" name="加装包" fill="#0d9488" maxBarSize={32} className="cursor-pointer" onClick={handleBarClick} />
-            <Bar dataKey="营销活动" stackId="cat" name="营销活动" fill="#d97706" maxBarSize={32} className="cursor-pointer" onClick={handleBarClick} />
-            <Bar
-              dataKey="港澳台/国际资费"
-              stackId="cat"
-              name="港澳台/国际资费"
-              fill="#db2777"
-              maxBarSize={32}
-              className="cursor-pointer"
-              onClick={handleBarClick}
-            />
+            <Legend formatter={(v: string) => shortCat(v)} wrapperStyle={{ fontSize: 11 }} />
+            {/* 分类系列动态渲染：数据里有哪些分类就画哪些（含标准资费等全类型） */}
+            {catKeys.map((k) => (
+              <Bar
+                key={k}
+                dataKey={k}
+                stackId="cat"
+                name={k}
+                fill={CATEGORY_HEX[k] ?? '#a8a29e'}
+                maxBarSize={32}
+                className="cursor-pointer"
+                onClick={handleBarClick}
+              />
+            ))}
           </BarChart>
         </ResponsiveContainer>
       </ChartCard>

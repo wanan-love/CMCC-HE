@@ -13,16 +13,12 @@ import {
   advancedCount,
   EMPTY_ADVANCED,
 } from './api'
+import { ALL_CATEGORIES, CATEGORY_COLORS } from './types'
 
 /** 高级筛选可选的资费类型（与库内实际分类对齐） */
-export const FILTER_CATEGORIES = ['套餐', '加装包', '营销活动', '港澳台/国际资费']
+export const FILTER_CATEGORIES = [...ALL_CATEGORIES]
 
-const CATEGORY_SWATCH: Record<string, string> = {
-  套餐: 'bg-amber-100 text-amber-800 border-amber-200',
-  加装包: 'bg-teal-100 text-teal-800 border-teal-200',
-  营销活动: 'bg-pink-100 text-pink-800 border-pink-200',
-  '港澳台/国际资费': 'bg-cyan-100 text-cyan-800 border-cyan-200',
-}
+const CATEGORY_SWATCH: Record<string, string> = { ...CATEGORY_COLORS }
 
 /** 高级筛选数值的合法性整理（提交给 API 前的兜底） */
 export function sanitizeAdvanced(f: AdvancedFilters): AdvancedFilters {

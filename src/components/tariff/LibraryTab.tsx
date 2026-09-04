@@ -11,9 +11,9 @@ import { Search, ChevronLeft, ChevronRight, Package, ArrowUpRight, ArrowDownRigh
 import { toast } from 'sonner'
 import { useTariffLibrary, type AdvancedFilters, EMPTY_ADVANCED } from './api'
 import { AdvancedFilterPopover, AdvancedFilterChips, sanitizeAdvanced } from './AdvancedFilter'
-import { CATEGORY_COLORS, daysUntil, type TariffItem } from './types'
+import { CATEGORY_COLORS, ALL_CATEGORIES, daysUntil, type TariffItem } from './types'
 
-const CATEGORIES = ['全部类型', '套餐', '加装包', '营销活动', '港澳台/国际资费']
+const CATEGORIES = ['全部类型', ...ALL_CATEGORIES]
 const STATUSES = ['全部状态', '在售', '已下线']
 const SORTS = [
   { value: 'newest', label: '最新上线' },

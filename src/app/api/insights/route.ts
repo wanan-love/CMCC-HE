@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { ALL_CATEGORIES } from '@/components/tariff/types'
 
 export const dynamic = 'force-dynamic'
 
@@ -117,7 +118,9 @@ export async function GET() {
     since24mCat.setMonth(since24mCat.getMonth() - 24)
     since24mCat.setDate(1)
     const since24mCatStr = since24mCat.toISOString().slice(0, 10)
-    const CATEGORY_KEYS = ['套餐', '加装包', '营销活动', '港澳台/国际资费'] as const
+    // 分类全集（含标准资费等全类型；与前端 ALL_CATEGORIES 同源，另兼容历史两种写法）
+    const CATEGORY_KEYS = [...ALL_CATEGORIES, '港澳台国际']
+    const emptyCatRow = () => Object.fromEntries(CATEGORY_KEYS.map((c) => [c, 0]))
     const addedWithCategory = await db.changeEvent.findMany({
       where: { date: { gte: since24mCatStr }, type: 'ADDED', source: { not: 'demo' } },
       select: { date: true, category: true },
@@ -125,9 +128,9 @@ export async function GET() {
     const catByMonth: Record<string, Record<string, number>> = {}
     for (const e of addedWithCategory) {
       const m = e.date.slice(0, 7)
-      if (!catByMonth[m]) catByMonth[m] = { 套餐: 0, 加装包: 0, 营销活动: 0, '港澳台/国际资费': 0 }
+      if (!catByMonth[m]) catByMonth[m] = emptyCatRow()
       // 未知/空分类跳过（不纳入构成图，避免误归）
-      if (!(CATEGORY_KEYS as readonly string[]).includes(e.category ?? '')) continue
+      if (!CATEGORY_KEYS.includes(e.category ?? '')) continue
       catByMonth[m][e.category!]++
     }
     const categoryMonthly = Object.entries(catByMonth)

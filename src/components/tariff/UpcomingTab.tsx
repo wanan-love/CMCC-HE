@@ -10,9 +10,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Timer, CalendarClock, Flame, Eye, Binoculars, TrendingDown, Search, RotateCcw, PackageSearch } from 'lucide-react'
 import { useUpcoming, type AdvancedFilters, advancedCount, EMPTY_ADVANCED } from './api'
 import { AdvancedFilterPopover, AdvancedFilterChips, sanitizeAdvanced } from './AdvancedFilter'
-import { CATEGORY_COLORS, formatDateCN, type TariffItem } from './types'
+import { CATEGORY_COLORS, ALL_CATEGORIES, formatDateCN, type TariffItem } from './types'
 
-const UPCOMING_CATEGORIES = ['全部类型', '套餐', '加装包', '营销活动', '港澳台/国际资费']
+const UPCOMING_CATEGORIES = ['全部类型', ...ALL_CATEGORIES]
 
 const DAY_RANGES = [
   { value: 30, label: '30天' },

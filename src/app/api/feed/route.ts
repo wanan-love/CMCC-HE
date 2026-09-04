@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { ALL_CATEGORIES } from '@/components/tariff/types'
 
 export const dynamic = 'force-dynamic'
 
@@ -12,7 +13,7 @@ export const dynamic = 'force-dynamic'
  * 排除 demo 演示事件，保证订阅内容真实。
  */
 
-const VALID_CATEGORIES = ['套餐', '加装包', '营销活动', '港澳台/国际资费']
+const VALID_CATEGORIES = [...ALL_CATEGORIES]
 const VALID_REGIONS = ['HEBEI']
 
 const TYPE_PREFIX: Record<string, string> = {

@@ -2,6 +2,41 @@
 
 > 本文档回答三个核心问题：**为什么抓取放 GitHub Actions、同步接口如何加密、D1 容量与读写费用是否可控**，并给出完整落地步骤。
 
+## 〇、公示页接口逆向与齐全性校验（2026-09-04）
+
+采集范围 = 个人 × 河北分省 × **全部资费类型**（套餐 / 加装包 / 营销活动 / 港澳台(国际)资费 /
+**标准资费** / 国际及港澳台标准资费 / 其他——下拉选项运行时动态枚举，页面增删类型自动覆盖）。
+
+**页面结构（Vue + webpack 动态 chunk，静态资源域 `res.app.coc.10086.cn` 可直抓分析）：**
+
+| chunk | 职责 |
+|---|---|
+| `tariffZonePers.js` | 入口 + Vuex store + API 模块 |
+| `templateCollection.js` | CMS 模板集（zf06Container 资费容器） |
+| `js/155.js` NavBarNew | 导航条：页签（全网/分省）、类型/系列/价格下拉、列表分页 + 懒加载 |
+| `js/837.js` tariffSerial | 资费卡片（`.tariff-item-container` 系选择器） |
+| `js/929/715/88/814.js` | 标准资费表格视图（StandarTariff → FreeContent → FreeDetail → vxe-table） |
+
+**关键接口（业务域 `h.app.coc.10086.cn`，均 POST JSON）：**
+
+| 接口 | 请求 | 响应要点 |
+|---|---|---|
+| `/website/nrapigate/nrtariff/new/Tariff/getTariffListInfo` | `{cellNum:'99999999999', province:'311', isPublic:'1', linkScn:'1', tariffAttr:'1'全网/'2'分省, type1:'1'个人/'2'政企, type2:'1'~'7', page, limit:5}` | `rspBody.(data?).{page:{total}, beans:[卡片数据]}` |
+| `/website/nrapigate/nrtariff/new/Tariff/getStandardlist` | `{province:'311', isPublic:'1'}` | `rspBody[0].tariffTable` 或 `rspBody.tariffList[0].tariffTable` = `{tHead, tBody}` |
+| `/website/nrapigate/nrtariff/new/Tariff/getType2List` | 同上省参数 | 当前（type1×tariffAttr）可用的类型清单 |
+
+**类型值映射（chunk-155 内硬编码）：** 1 套餐 / 2 加装包 / 3 营销活动 / 4 港澳台/国际资费 /
+5 标准资费（下拉里是特殊值 `标准资费VALUE`，仅分省页签且标准数据存在时出现，**不走列表 API**，
+数据在选省时由 getStandardlist 拉取）/ 6 国际及港澳台标准资费 / 7 其他。
+河北省份编码 `311`（URL 里的 `prov=531` 是山东，页面加载后需手动切省）。
+
+**齐全性校验（scrape.mjs 内置）：** Playwright `page.on('response')` 拦截以上 XHR——
+以接口声明的 `page.total` 逐一核对每类型实际抓到的 DOM 卡片数（DOM 即 beans 渲染结果）；
+标准资费直接消费 getStandardlist 原始表格 JSON（tHead/tBody → 卡片字段，无方案编号的行合成
+`STD-<md5(名称)>` 稳定编号，内容变化=同编号 contentHash 变化=UPDATED 事件）。
+任一类型不齐全 → 自愈重抓一次 → 仍不足则脚本非零退出，workflow 中止（不推送，杜绝漏抓上线）。
+报告落盘 `seed/api/api-report.json` 随 artifact 归档。
+
 ## 一、架构总览
 
 ```
