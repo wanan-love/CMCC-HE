@@ -1,31 +1,32 @@
 /**
- * 中国移动河北资费公示抓取 —— GitHub Actions / 本地通用版（Playwright · 并行 worker pool）
+ * 中国移动河北资费公示抓取 —— GitHub Actions / 本地通用版（Playwright）
  * 运行: node scripts/scrape.mjs   （需先: npm i playwright && npx playwright install --with-deps chromium）
- * 并行: SCRAPE_CONCURRENCY=2 node scripts/scrape.mjs（默认 2，可 1~4）
  * 冒烟: SCRAPE_SMOKE=1 node scripts/scrape.mjs  （单 worker 验证导航+选择器健康，约 1 分钟，不落盘）
+ *
+ * 采集范围（2026-09 按需求收敛）：仅「个人资费 · 河北省专属」——
+ *   不做全网业务、不做政企业务。单个列表页签完整真人节奏遍历，约 3~8 分钟
+ *   （视列表长度与出口网络状况；原 4 阶段全量版需 20~30 分钟）。
  *
  * 网络出口：GitHub Actions 中由 workflow 先连接 Cloudflare WARP（warp-cli connect 隧道接管全机流量），
  *           Chromium 的全部请求自然经 WARP 出口，避免数据中心 IP 直接访问公示页被风控。
  *           若 runner 网络限制 TUN 隧道，workflow 会自动降级 SOCKS 代理模式并注入 WARP_SOCKS 环境变量，
  *           本脚本读取该变量让 Chromium 走 socks5 代理（效果等价，推送 API 走直连）。
  *
- * 并行模型（多"虚拟用户"同时浏览）：
- *   4 个采集阶段（个人/全网 · 个人/河北 · 政企/全网 · 政企/河北）为独立工作单元，
- *   worker pool 并行认领执行——每个 worker 拥有独立 browser context：
- *   独立 cookie/localStorage、独立微随机视口、独立随机节奏序列（= 同一 WARP 出口 IP 后的多个真实用户，
- *   CGNAT 共享出口下多会话本属常态）。worker 内部保持完整真人节奏串行遍历。
- *   并发 2 时全量约 10~15 分钟（串行版 20~30 分钟）。
+ * worker 池结构说明：当前仅 1 个采集阶段（个人×河北），默认单 worker 串行；
+ *   保留 worker pool 骨架（SCRAPE_CONCURRENCY 可调，1~4），未来若恢复多阶段/多类型并行
+ *   只需向 TASKS 数组追加工作单元，每个 worker 即独立 browser context（独立 cookie/
+ *   localStorage、独立微随机视口、独立随机节奏序列 = 同一 WARP 出口后的多个真实用户）。
  *
  * 真人节奏（防风控核心，处处随机不可预测；每个 worker 各自独立）：
  *   1. 所有等待均带随机抖动 jitter(min,max)——没有两次运行的节奏相同；
  *   2. 滚动是「浏览式」而非「机器式」：每轮 1~3 小步滚动 + 轮末直跳绝对底部（懒加载触发器），
  *      步间 0.8~1.8s，轮间 2~5s，15% 概率 5~9s「阅读停留」；
- *   3. 切类型 8~13s、切页签 8~16s、换阶段 8~15s 大间隔随机；
+ *   3. 切页签 8~16s、重试冷却 60~90s 大间隔随机；
  *   4. 视口尺寸每个 worker 独立微随机（宽 1346~1386 / 高 870~930）；
  *   5. 偶发鼠标轨迹漂移（mouseDrift），补充真实指针事件。
  *
- * 输出: seed/p_n_*.json / seed/p_h_all.json / seed/g_n_*.json / seed/g_h_all.json
- *   （每文件为 JSON 数组：[{name, fields, usage, gray}]，与 agent-browser 版结构一致，供 normalize.mjs 消费）
+ * 输出: seed/p_h_all.json（JSON 数组：[{name, fields, usage, gray}]，
+ *   与 agent-browser 版结构一致，供 normalize.mjs 消费）
  */
 import { chromium } from 'playwright'
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -37,12 +38,10 @@ const OUT_DIR = process.env.SCRAPE_OUT_DIR || join(__dirname, '..', 'seed')
 const SMOKE = !!process.env.SCRAPE_SMOKE
 const URL =
   'https://h.app.coc.10086.cn/cmcc-app/pc-pages/tariffZonePers.html?pageId=834148205904408576&prov=531'
-// SCRAPE_ONLY=套餐,加装包 可只跑指定类型（调试用）；输出重定向用 SCRAPE_OUT_DIR
-const TYPES = (process.env.SCRAPE_ONLY ? process.env.SCRAPE_ONLY.split(',') : ['套餐', '加装包', '营销活动', '港澳台/国际资费'])
-// 并行 worker 数（SMOKE 固定单 worker；常规 1~4，默认 2）
+// worker 数（SMOKE 固定单 worker；常规默认 1——单阶段无需并行，结构上仍支持 1~4）
 const CONCURRENCY = SMOKE
   ? 1
-  : Math.max(1, Math.min(4, parseInt(process.env.SCRAPE_CONCURRENCY || '2', 10)))
+  : Math.max(1, Math.min(4, parseInt(process.env.SCRAPE_CONCURRENCY || '1', 10)))
 
 mkdirSync(OUT_DIR, { recursive: true })
 
@@ -167,7 +166,7 @@ async function scrollAll(w, maxRounds = 120) {
       )
       if (atBottom) {
         // 慢出口（WARP/跨境）在途批次兜底：到底后长停顿 6~12s 再数一次，
-        // 有新增则计数清零继续（大列表类型实测 1318↔450 波动即此因——批次延迟超 stall 窗口被误判完成）
+        // 有新增则计数清零继续（大列表实测 1318↔450 波动即此因——批次延迟超 stall 窗口被误判完成）
         await w.jitter(6, 12)
         const recheck = await countCards(w)
         if (recheck === now) break // 确认真无新增
@@ -177,7 +176,7 @@ async function scrollAll(w, maxRounds = 120) {
       }
     }
   }
-  // 平滑回到顶部（类型切换控件在页首；浏览完回看顶部也更像真人）
+  // 平滑回到顶部（页签控件在页首；浏览完回看顶部也更像真人）
   await w.page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' }))
   await w.jitter(1.2, 2.5)
   return last
@@ -257,142 +256,45 @@ async function saveJson(w, cards, filename) {
   w.log(`saved: ${path} (${cards.length} cards)`)
 }
 
-/** 类型下拉选择（.select-box[0] → 可见 .select-item 中文本匹配的类型） */
-async function selectType(w, type) {
-  await mouseDrift(w)
-  await w.page.evaluate(() => document.querySelectorAll('.select-box')[0]?.click())
-  await w.jitter(1.2, 2.5)
-  const res = await w.page.evaluate((t) => {
-    const opts = [...document.querySelectorAll('.select-item')].filter((e) => e.offsetParent !== null)
-    const hit = opts.find((e) => (e.innerText || '').trim() === t)
-    if (hit) {
-      hit.click()
-      return 'ok'
-    }
-    return 'nf'
-  }, type)
-  await w.jitter(8, 13) // 切类型后列表整页重新加载，慢慢等
-  await waitIdle(w)
-  return res
-}
+/* ---------- 采集阶段（独立工作单元，可被任意 worker 认领） ---------- */
 
-const fileSafe = (type) => type.replace(/\//g, '_').replace(/资费/g, '')
-
-/* ---------- 4 个采集阶段（独立工作单元，可被任意 worker 认领） ---------- */
-
-/** 阶段 1：个人资费 / 全网资费 × 各类型 */
-async function phasePersonalNational(w) {
-  w.log('=== PHASE: 个人资费/全网资费 各类型 ===')
-  await resetToHebei(w)
-  for (const type of TYPES) {
-    const res = await selectType(w, type)
-    if (res === 'nf') {
-      w.log(`personal/national/${type}: 类型不存在，跳过`)
-      continue
-    }
-    let count = await scrollAll(w, SMOKE ? 3 : 120)
-    if (!SMOKE && count === 0) {
-      // 类型级自愈：0 cards（限流/慢批次）——冷却 60~90s 后重选类型重抓一次
-      w.log(`personal/national/${type}: 0 cards——冷却后重试一次`)
-      await w.jitter(60, 90)
-      await selectType(w, type)
-      count = await scrollAll(w, 120)
-    }
-    w.log(`personal/national/${type}: ${count} cards`)
-    const cards = count > 0 ? await extractCards(w) : null
-    if (SMOKE && cards) {
-      // 冒烟只验证健康，不落盘（避免覆盖 seed/ 下的全量数据）
-      w.log(`SMOKE 样本（${cards.length} cards）: ${cards.slice(0, 3).map((c) => c.name).join(' / ')}`)
-      return 'smoke-ok'
-    }
-    if (cards) await saveJson(w, cards, `p_n_${fileSafe(type)}.json`)
-    await w.jitter(3, 6) // 类型之间的浏览间歇
-  }
-}
-
-/** 阶段 2：个人资费 / 河北资费（全部类型） */
+/** 唯一阶段：个人资费 / 河北资费（全部列表） */
 async function phasePersonalHebei(w) {
   w.log('=== PHASE: 个人资费/河北资费 ===')
   await resetToHebei(w)
   await w.page.evaluate(() => document.querySelectorAll('.range-tab')[1]?.click())
   await w.jitter(10, 16)
   await waitIdle(w)
-  let count = await scrollAll(w)
-  if (count === 0) {
+  let count = await scrollAll(w, SMOKE ? 3 : 120)
+  if (!SMOKE && count === 0) {
+    // 列表级自愈：0 cards（限流/慢批次）——冷却 60~90s 后重切页签重抓一次
     w.log('personal/hebei/all: 0 cards——冷却后重试一次')
     await w.jitter(60, 90)
     await w.page.evaluate(() => document.querySelectorAll('.range-tab')[1]?.click())
     await w.jitter(10, 16)
     await waitIdle(w)
-    count = await scrollAll(w)
+    count = await scrollAll(w, 120)
   }
   w.log(`personal/hebei/all: ${count} cards`)
-  if (count > 0) await saveJson(w, await extractCards(w), 'p_h_all.json')
-}
-
-/** 阶段 3：政企资费 / 全网资费 × 各类型 */
-async function phaseGovNational(w) {
-  w.log('=== PHASE: 政企资费/全网资费 各类型 ===')
-  await resetToHebei(w)
-  await w.page.evaluate(() => document.querySelectorAll('.tab-item')[1]?.click())
-  await w.jitter(8, 14)
-  await waitIdle(w)
-  for (const type of TYPES) {
-    const res = await selectType(w, type)
-    if (res === 'nf') {
-      w.log(`gov/national/${type}: 类型不存在，跳过`)
-      continue
-    }
-    let count = await scrollAll(w)
-    if (count === 0) {
-      w.log(`gov/national/${type}: 0 cards——冷却后重试一次`)
-      await w.jitter(60, 90)
-      await selectType(w, type)
-      count = await scrollAll(w)
-    }
-    w.log(`gov/national/${type}: ${count} cards`)
-    if (count > 0) await saveJson(w, await extractCards(w), `g_n_${fileSafe(type)}.json`)
-    await w.jitter(3, 6)
+  const cards = count > 0 ? await extractCards(w) : null
+  if (SMOKE) {
+    if (!cards) throw new Error('SMOKE 未抓到任何卡片（选择器或页面结构可能已变化）')
+    // 冒烟只验证健康，不落盘（避免覆盖 seed/ 下的全量数据）
+    w.log(`SMOKE 样本（${cards.length} cards）: ${cards.slice(0, 3).map((c) => c.name).join(' / ')}`)
+    return 'smoke-ok'
   }
+  if (cards) await saveJson(w, cards, 'p_h_all.json')
 }
 
-/** 阶段 4：政企资费 / 河北资费（全部类型） */
-async function phaseGovHebei(w) {
-  w.log('=== PHASE: 政企资费/河北资费 ===')
-  await resetToHebei(w)
-  await w.page.evaluate(() => document.querySelectorAll('.tab-item')[1]?.click())
-  await w.jitter(8, 14)
-  await waitIdle(w)
-  await w.page.evaluate(() => document.querySelectorAll('.range-tab')[1]?.click())
-  await w.jitter(10, 16)
-  await waitIdle(w)
-  let count = await scrollAll(w)
-  if (count === 0) {
-    w.log('gov/hebei/all: 0 cards——冷却后重试一次')
-    await w.jitter(60, 90)
-    await w.page.evaluate(() => document.querySelectorAll('.range-tab')[1]?.click())
-    await w.jitter(10, 16)
-    await waitIdle(w)
-    count = await scrollAll(w)
-  }
-  w.log(`gov/hebei/all: ${count} cards`)
-  if (count > 0) await saveJson(w, await extractCards(w), 'g_h_all.json')
-}
-
-const TASKS = [
-  { label: '个人×全网', run: phasePersonalNational },
-  { label: '个人×河北', run: phasePersonalHebei },
-  { label: '政企×全网', run: phaseGovNational },
-  { label: '政企×河北', run: phaseGovHebei },
-]
+const TASKS = [{ label: '个人×河北', run: phasePersonalHebei }]
 
 tlog(
-  `启动：模式=${SMOKE ? 'SMOKE（快速冒烟·单 worker）' : `FULL（全量抓取·${CONCURRENCY} 并行 worker）`}，` +
+  `启动：模式=${SMOKE ? 'SMOKE（快速冒烟·单 worker）' : `FULL（个人×河北 · ${CONCURRENCY} worker）`}，` +
     `任务=${TASKS.map((t) => t.label).join(' / ')}` +
     (process.env.WARP_SOCKS ? `，代理=${process.env.WARP_SOCKS}` : '，出口=TUN 直连')
 )
 
-/* ---------- worker pool：N 个"虚拟用户"并行认领 4 个阶段（SMOKE 只跑首个阶段的首个类型） ---------- */
+/* ---------- worker pool：N 个"虚拟用户"并行认领阶段（当前单阶段=单 worker） ---------- */
 let nextTask = 0
 const settled = await Promise.allSettled(
   Array.from({ length: CONCURRENCY }, (_, i) =>
@@ -401,14 +303,13 @@ const settled = await Promise.allSettled(
       try {
         while (true) {
           const idx = nextTask++
-          if (SMOKE && idx > 0) break // 冒烟只验证第一个阶段
           if (idx >= TASKS.length) break
           const task = TASKS[idx]
           w.log(`领取任务: ${task.label}`)
           if (idx > 0) await w.jitter(8, 15) // 阶段间大间隔（首个任务无需）
           const r = await task.run(w)
           if (SMOKE && r === 'smoke-ok') {
-            w.log('SMOKE 通过 ✓ 导航 + 河北选择 + 类型切换 + 滚动 + 卡片选择器全部健康')
+            w.log('SMOKE 通过 ✓ 导航 + 河北选择 + 页签切换 + 滚动 + 卡片选择器全部健康')
             await w.context.close()
             return 'smoke-ok'
           }

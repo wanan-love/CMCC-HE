@@ -1,6 +1,7 @@
 # 每日资费抓取 → 归一化 → 加密推送（Cloudflare Workers 做不了浏览器渲染抓取，故用 GitHub Actions）
 #
 # 触发：每日 UTC 20:00（北京时间 04:00）+ 手动 workflow_dispatch
+# 采集范围：仅「个人资费 × 河北省专属」（不做全网业务与政企业务，单列表约 3~8 分钟）
 # 采集出口（三级尝试）：
 #   1. warp-cli TUN 模式（60s 快试；GitHub runner 实测数据面大概率不通，仅环境兜底）
 #   2. docker 容器化 WARP（caomingjun/warp，socks5://127.0.0.1:1080）——runner 上实测唯一稳定路径
@@ -32,8 +33,8 @@ env:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # 真人节奏（随机间隔）拉长了整体耗时，预留充裕超时
-    timeout-minutes: 60
+    # WARP 安装/连接约 3~8 分钟 + 单阶段真人节奏抓取 3~8 分钟 + 推送重试缓冲
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -132,12 +133,8 @@ jobs:
             direct)       curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|loc|colo)=' || true ;;
           esac
 
-      # ---------- 抓取（WARP 出口 + 真人节奏 · 多 worker 并行） ----------
-      - name: Scrape 公示页（河北 · 个人/政企 × 全网/河北，2 worker 并行 + 真人节奏）
-        env:
-          # 并行 worker 数（1~4）：每个 worker 独立 context/指纹/节奏，同一 WARP 出口后的多个"虚拟用户"
-          # 2 = 全量约 10~15 分钟（串行版 20~30）；调 4 约 6~8 分钟但 runner CPU 压力增大
-          SCRAPE_CONCURRENCY: '2'
+      # ---------- 抓取（WARP 出口 + 真人节奏） ----------
+      - name: Scrape 公示页（个人×河北单阶段，真人节奏）
         run: node scripts/scrape.mjs
 
       - name: Normalize 归一化
@@ -148,7 +145,7 @@ jobs:
           node -e "
             const items = require('./seed/tariffs.normalized.json');
             if (!Array.isArray(items) || items.length === 0) { console.error('抓取结果为空'); process.exit(1); }
-            if (items.length < 200) { console.error('抓取数量异常偏少: ' + items.length + '（公示页可能改版，需人工检查选择器）'); process.exit(1); }
+            if (items.length < 50) { console.error('抓取数量异常偏少: ' + items.length + '（公示页可能改版，需人工检查选择器）'); process.exit(1); }
             console.log('sanity ok: ' + items.length + ' items');
           "
 

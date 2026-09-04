@@ -22,16 +22,17 @@
 
 ## 二、后端存储：现在是什么？D1 够不够？
 
-**现状（沙箱）**：SQLite 单文件（Prisma ORM），`db/custom.db` 当前 **5.82 MB**。
+**现状（沙箱）**：SQLite 单文件（Prisma ORM），`db/custom.db`。
+（2026-09 起采集范围收敛为仅「个人×河北」，下表为原 4 阶段全量时代的实测基准，
+收敛后行数仅为其中「个人×河北」部分，容量结论只会更宽裕。）
 
 **生产方案**：Cloudflare **D1**（就是托管版 SQLite），三张表结构不变：
 
-| 表 | 当前行数 | 平均行大小 | 当前体积 |
-|---|---|---|---|
-| Tariff（资费当前态） | 3,109 | ~775 B | ≈ 2.4 MB |
-| ChangeEvent（变更事件） | 3,109 | ~292 B | ≈ 0.9 MB |
-| SyncRun（同步记录） | 17 | ~200 B | 忽略 |
-| 索引等 | — | — | 全库 5.82 MB |
+| 表 | 原全量基准行数 | 平均行大小 |
+|---|---|---|
+| Tariff（资费当前态） | 3,109（4 阶段全量） | ~775 B |
+| ChangeEvent（变更事件） | 3,109 | ~292 B |
+| SyncRun（同步记录） | 17 | ~200 B |
 
 **容量估算（0.5 GB 上限内吗？——完全够）：**
 
@@ -208,16 +209,18 @@ wrangler d1 execute hebei-tariff --remote --command "SELECT COUNT(*) FROM Tariff
 - 切类型 8~13s、切页签 8~16s、换阶段 8~15s 大间隔随机；
 - 视口尺寸每个 worker 独立微随机（宽 1346~1386 × 高 870~930）；偶发鼠标轨迹漂移；UA 主版本微随机。
 
-**多 worker 并行抓取**（缩短总耗时，`SCRAPE_CONCURRENCY` 默认 2，可 1~4）：
+**多 worker 池与采集范围（2026-09 收敛）：**
 
-- 4 个采集阶段（个人/政企 × 全网/河北）为独立工作单元，worker pool 并行认领；
-- 每个 worker 独立 browser context（独立 cookie/存储/视口指纹/节奏序列）——
-  相当于同一 WARP 出口（CGNAT 共享 IP）后的多个真实用户同时在浏览，属常态流量画像；
-- worker 内部保持完整真人节奏串行遍历，不牺牲单会话的拟人度；
-- 并发 2：全量约 10~15 分钟（原串行版 20~30 分钟）；并发 4 约 6~8 分钟但注意 runner CPU；
-- 本地验证并行健康度：`SCRAPE_CONCURRENCY=2 SCRAPE_OUT_DIR=/tmp/pt node scripts/scrape.mjs`。
+- **采集范围仅「个人资费 × 河北省专属」**（不做全网业务与政企业务）：单列表页签
+  完整真人节奏遍历约 3~8 分钟，D1 写入与容量压力比原 4 阶段全量版（个人/政企 × 全网/河北）更小；
+- scrape.mjs 保留 worker pool 骨架（`SCRAPE_CONCURRENCY` 1~4）：未来恢复多阶段时，
+  每阶段为独立工作单元，worker 并行认领，每个 worker 独立 browser context
+  （独立 cookie/存储/视口指纹/节奏序列）——相当于同一 WARP 出口（CGNAT 共享 IP）后的
+  多个真实用户同时在浏览，属常态流量画像；worker 内部保持完整真人节奏串行遍历；
+- 本地验证：`SCRAPE_OUT_DIR=/tmp/pt node scripts/scrape.mjs`；
+- 输出仅 `seed/p_h_all.json`（normalize.mjs 仍兼容历史四类文件名前缀，便于回灌旧 artifact）。
 
-**选择器快速冒烟**（约 1 分钟：导航 + 选河北 + 切首个类型 + 滚 3 轮 + 抽样 3 张卡片名，不写 seed 文件）：
+**选择器快速冒烟**（约 1 分钟：导航 + 选河北 + 切「河北」页签 + 滚 3 轮 + 抽样 3 张卡片名，不写 seed 文件）：
 
 ```bash
 SCRAPE_SMOKE=1 node scripts/scrape.mjs   # 本地排查"是选择器坏了还是网络问题"的利器

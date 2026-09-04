@@ -1,6 +1,7 @@
 /**
  * 种子数据处理：合并抓取的 JSON → 规范化 → 导入数据库
  * 运行: bun scripts/seed-db.ts
+ * （当前采集范围已收敛为仅个人×河北：seed/p_h_all.json，normalize 兼容历史四类文件名）
  */
 import { db } from '../src/lib/db'
 import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from 'fs'
@@ -72,7 +73,8 @@ function normalize(): NormalizedTariff[] {
 
   for (const file of files) {
     const raw = JSON.parse(readFileSync(join(SEED_DIR, file), 'utf-8'))
-    const cards: RawCard[] = JSON.parse(raw.data?.result ?? '[]')
+    // 兼容两种输入：scrape.mjs 的纯数组与 agent-browser --json 输出（{data:{result:"[...]"}}）
+    const cards: RawCard[] = Array.isArray(raw) ? raw : JSON.parse(raw.data?.result ?? '[]')
     const meta = fileMeta(file)
 
     for (const c of cards) {

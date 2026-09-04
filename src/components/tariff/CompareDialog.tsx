@@ -109,7 +109,6 @@ export function CompareDialog({
         const d = daysUntil(t.offlineDate)
         return d === null ? null : `${d} 天`
       }),
-      mk('适用对象', (t) => t.scope),
       mk('适用范围', (t) => t.target),
       mk('销售渠道', (t) => t.channels),
       mk('有效期限', (t) => t.effective),

@@ -885,7 +885,7 @@ function EventRow({
   )
 }
 
-/** 订阅入口：RSS / JSON 订阅源弹层（支持类型/分类/地域/回看天数定制链接）
+/** 订阅入口：RSS / JSON 订阅源弹层（支持类型/分类/回看天数定制链接）
  *  桌面：Popover 锚点弹层；移动端：底部 Sheet 抽屉（拇指可达 + 内容全展开） */
 function FeedButton() {
   const isMobile = useIsMobile()
@@ -893,7 +893,6 @@ function FeedButton() {
   const [copied, setCopied] = useState<string | null>(null)
   const [feedType, setFeedType] = useState<'' | 'ADDED' | 'REMOVED' | 'UPDATED'>('')
   const [feedCategory, setFeedCategory] = useState('')
-  const [feedRegion, setFeedRegion] = useState('')
   const [feedDays, setFeedDays] = useState('30')
 
   const buildUrl = (format: 'rss' | 'json') => {
@@ -906,7 +905,6 @@ function FeedButton() {
     if (format === 'json') sp.set('format', 'json')
     if (feedType) sp.set('type', feedType)
     if (feedCategory) sp.set('category', feedCategory)
-    if (feedRegion) sp.set('region', feedRegion)
     if (feedDays !== '30') sp.set('days', feedDays)
     const qs = sp.toString()
     return `/api/feed${qs ? '?' + qs : ''}`
@@ -969,30 +967,6 @@ function FeedButton() {
                 }`}
               >
                 {c ? (c === '港澳台/国际资费' ? '港澳台/国际' : c) : '全部分类'}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* 地域范围过滤 */}
-        <div className="mb-2.5">
-          <div className="text-[10px] font-medium text-stone-500 mb-1.5">地域范围</div>
-          <div className="flex flex-wrap gap-1.5">
-            {[
-              { value: '', label: '全部地域', hint: '全网 + 河北专属' },
-              { value: 'HEBEI', label: '仅河北专属', hint: '适用范围为「河北」的资费' },
-            ].map((r) => (
-              <button
-                key={r.value || 'region-all'}
-                onClick={() => setFeedRegion(r.value)}
-                title={r.hint}
-                className={`px-2 h-6 text-[11px] rounded-md border transition-colors ${
-                  feedRegion === r.value
-                    ? 'bg-rose-600 text-white border-rose-600'
-                    : 'bg-white text-stone-600 border-stone-200 hover:border-stone-300'
-                }`}
-              >
-                {r.label}
               </button>
             ))}
           </div>

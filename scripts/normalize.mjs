@@ -32,7 +32,8 @@ function parsePrice(s) {
   return isNaN(v) ? null : v
 }
 
-/** 从文件名推断 scope/range */
+/** 从文件名推断 scope/range（当前采集范围仅个人×河北 → seed/p_h_all.json；
+ *  保留四类前缀兼容历史快照文件，便于回灌旧 artifact 数据） */
 function fileMeta(filename) {
   if (filename.startsWith('p_n_')) return { scope: '个人', range: '全网' }
   if (filename.startsWith('p_h_')) return { scope: '个人', range: '河北' }

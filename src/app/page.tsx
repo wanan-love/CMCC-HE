@@ -374,7 +374,7 @@ export default function Home() {
       {/* Footer */}
       <footer className="mt-auto border-t border-stone-200 bg-white/80 backdrop-blur-sm pb-[env(safe-area-inset-bottom)]">
         <div className="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-stone-400">
-          <span>数据来源：中国移动资费公示专区（h.app.coc.10086.cn）· 河北省个人/政企资费</span>
+          <span>数据来源：中国移动资费公示专区（h.app.coc.10086.cn）· 河北省个人资费</span>
           <span className="text-stone-200">|</span>
           <span>本站仅为公开信息聚合展示，资费详情以官方公示为准</span>
           <span className="text-stone-200">|</span>

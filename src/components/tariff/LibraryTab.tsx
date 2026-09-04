@@ -14,7 +14,6 @@ import { AdvancedFilterPopover, AdvancedFilterChips, sanitizeAdvanced } from './
 import { CATEGORY_COLORS, daysUntil, type TariffItem } from './types'
 
 const CATEGORIES = ['全部类型', '套餐', '加装包', '营销活动', '港澳台/国际资费']
-const SCOPES = ['全部对象', '个人', '政企']
 const STATUSES = ['全部状态', '在售', '已下线']
 const SORTS = [
   { value: 'newest', label: '最新上线' },
@@ -63,7 +62,6 @@ export function LibraryTab({
   const [category, setCategory] = useState(
     CATEGORIES.includes(initialCategory) ? initialCategory : '全部类型'
   )
-  const [scope, setScope] = useState('全部对象')
   const [status, setStatus] = useState('全部状态')
   const [sort, setSort] = useState('newest')
   const [q, setQ] = useState('')
@@ -91,7 +89,6 @@ export function LibraryTab({
 
   const { data, isLoading } = useTariffLibrary({
     category: category === '全部类型' ? '' : category,
-    scope: scope === '全部对象' ? '' : scope,
     status: status === '全部状态' ? '' : status === '在售' ? 'ONLINE' : 'OFFLINE',
     sort,
     q: query,
@@ -109,7 +106,6 @@ export function LibraryTab({
   const exportCsv = () => {
     const sp = new URLSearchParams()
     if (category !== '全部类型') sp.set('category', category)
-    if (scope !== '全部对象') sp.set('scope', scope)
     if (status !== '全部状态') sp.set('status', status === '在售' ? 'ONLINE' : 'OFFLINE')
     if (query) sp.set('q', query)
     if (advClean.catMode === 'include' && advClean.cats.length) sp.set('catIn', advClean.cats.join(','))
@@ -156,17 +152,6 @@ export function LibraryTab({
             <SelectContent>
               {CATEGORIES.map((c) => (
                 <SelectItem key={c} value={c} className="text-xs">{c}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-
-          <Select value={scope} onValueChange={(v) => { setScope(v); setPage(1) }}>
-            <SelectTrigger className="w-[100px] h-8 text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {SCOPES.map((s) => (
-                <SelectItem key={s} value={s} className="text-xs">{s}</SelectItem>
               ))}
             </SelectContent>
           </Select>
@@ -357,7 +342,7 @@ function TariffCard({
               {tariff.category}
             </Badge>
             <Badge variant="outline" className="text-[10px] bg-stone-50 text-stone-500 border-stone-200">
-              {tariff.scope}·{tariff.range}
+              河北
             </Badge>
             {isOffline && (
               <Badge className="text-[10px] bg-rose-100 text-rose-700 border border-rose-200 hover:bg-rose-100">

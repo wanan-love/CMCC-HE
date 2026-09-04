@@ -79,11 +79,9 @@ export function TariffDetailDialog({
                 <Badge variant="outline" className={CATEGORY_COLORS[tariff?.category ?? ''] ?? CATEGORY_COLORS['其他']}>
                   {tariff?.category ?? '…'}
                 </Badge>
-                {tariff?.scope && (
-                  <Badge variant="outline" className="bg-stone-50 text-stone-600 border-stone-200">
-                    {tariff.scope} · {tariff.range}
-                  </Badge>
-                )}
+                <Badge variant="outline" className="bg-stone-50 text-stone-600 border-stone-200">
+                  河北个人资费
+                </Badge>
                 {tariff?.status === 'OFFLINE' ? (
                   <Badge className="bg-rose-100 text-rose-700 border border-rose-200 hover:bg-rose-100">
                     已下线
