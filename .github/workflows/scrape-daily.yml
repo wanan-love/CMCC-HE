@@ -37,9 +37,9 @@ env:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # WARP 安装/连接约 2~6 分钟 + 全类型真人节奏抓取 25~35 分钟（生产实测：v4 验证节奏
-    # + 全量懒加载 2.5 万秒级翻页 + 自愈轮，40 分钟实测不够被超时杀）+ 推送重试缓冲
-    timeout-minutes: 60
+    # WARP 安装/连接约 2~6 分钟 + 全类型真人节奏抓取（v4.3 提速后 ≈25~35 分钟，
+    # 生产实测：两轮 40/60min 超时被杀→提速+total 神谕；90min 留足余量）+ 推送缓冲
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -141,6 +141,18 @@ jobs:
       # ---------- 抓取（WARP 出口 + 真人节奏 + 逆向接口齐全性校验） ----------
       - name: Scrape 公示页（个人×河北全类型，真人节奏 + 接口齐全性闸门）
         run: node scripts/scrape.mjs
+
+      # 原始抓取产物立即归档（if:always()：即使后续失败/超时中断也不丢证据链；
+      # 含 api-report/beans dump/各类型原始卡片——两轮生产超时丢报告的教训）
+      - name: Upload raw scrape dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ github.run_number }}
+          path: |
+            seed/
+          retention-days: 90
+          if-no-files-found: warn
 
       - name: Normalize 归一化
         run: node scripts/normalize.mjs

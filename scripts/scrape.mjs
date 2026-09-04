@@ -378,16 +378,25 @@ const countCards = (w) =>
   w.page.evaluate(() => document.querySelectorAll('.tariff-item-container').length)
 
 /**
- * 真人式滚动收集：每轮若干小步浏览 + 直跳绝对底部（触发懒加载的关键），
- * 直到卡片数连续 10 轮无增长、已到页面真实底部、且底部 3 轮长复查无新增。
+ * 真人式滚动收集，直到列表加载完成。
  *
- * 关键教训（生产实测）：懒加载以「到达/接近底部」为触发条件；纯小步平滑滚动
- * 可能始终到不了底部，且慢网络（WARP/跨境）下批次在途时停滞计数即成立 →
- * 提前终止漏抓。故：① 每轮末直跳绝对底部；② 停滞 10 轮 + 真底校验；
- * ③ 到底后最多 3 轮 8~15s 长复查（慢批次兜底，任一轮有新增即回主循环）。
+ * 完成判定（v4.3 三重，按优先级）：
+ *   1) 【total 神谕】捕获到的接口 page.total 已知 且 卡片数 ≥ total——接口声明的
+ *      全部条目已在 DOM，短确认（2×5s 无新增）后收工。这是生产实测最重要的判据：
+ *      v4.1/4.2 两轮生产运行中「stall 10 轮 + 3×长复查」在 WARP 慢批次下提前收工
+ *      （营销活动 555/1032 即中断），外层再整列表重滚一遍极耗时（自愈轮 ~13 分钟）；
+ *   2) 停滞 10 轮 + 已到真底 + 3 轮 8~15s 长复查无新增（total 未知时的兜底）；
+ *   3) 0 卡片空转 12 轮（≈1 分钟）提前退出，交由外层类型级自愈/失败。
+ *
+ * 节奏（v4.3 提速，生产实测每页 ~6.5s 节奏拉 445 页要 48 分钟超时）：
+ *   主循环每轮 = 直跳绝对底部（懒加载触发器）+ 1.6~3.0s 间歇（≈2.3s/页）；
+ *   10% 概率插入 1~2 小步浏览 + 8% 概率阅读停留 4~8s——保持真人多样性的同时
+ *   批量吞吐提速 ~2.5 倍（急性子用户按住 End 键翻列表的形态）。
+ *
  * @param maxRounds 最大滚动轮数（SMOKE 模式传小值快速验证）
+ * @param oracleTotal 动态取接口声明 total 的闭包（捕获已知时启用 total 神谕）
  */
-async function scrollAll(w, maxRounds = 120) {
+async function scrollAll(w, maxRounds = 220, oracleTotal = null) {
   await waitIdle(w)
   const stallRounds = 10
   let stall = 0
@@ -397,23 +406,41 @@ async function scrollAll(w, maxRounds = 120) {
     const prev = await countCards(w)
     if (prev === 0) emptyRounds++
     else emptyRounds = 0
-    // 0 卡片兜底：空转 12 轮（≈2 分钟无内容）提前退出，交由外层类型级自愈/失败
     if (emptyRounds >= 12) break
-    const steps = 1 + Math.floor(Math.random() * 3)
-    for (let s = 0; s < steps; s++) {
-      await w.page.evaluate(() => {
-        const h = window.innerHeight * (0.8 + Math.random() * 0.7)
-        window.scrollBy({ top: h, behavior: 'instant' })
-      })
-      await w.jitter(0.8, 1.8)
+    // 10% 概率小步浏览（真人多样性；非每轮必做——v4.3 提速）
+    if (Math.random() < 0.1) {
+      const steps = 1 + Math.floor(Math.random() * 2)
+      for (let s = 0; s < steps; s++) {
+        await w.page.evaluate(() => {
+          const h = window.innerHeight * (0.8 + Math.random() * 0.7)
+          window.scrollBy({ top: h, behavior: 'instant' })
+        })
+        await w.jitter(0.8, 1.8)
+      }
     }
     await mouseDrift(w)
     // 直跳绝对底部（模拟 End 键）——懒加载触发器
     await w.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
-    await (Math.random() < 0.15 ? w.jitter(5, 9) : w.jitter(2, 5))
+    await (Math.random() < 0.08 ? w.jitter(4, 8) : w.jitter(1.6, 3))
     const now = await countCards(w)
     stall = prev === now ? stall + 1 : 0
     last = now
+    // total 神谕：接口声明全部到位即收工（2×5s 短确认防在途）
+    const oracle = oracleTotal ? await Promise.resolve(oracleTotal()) : null
+    if (oracle != null && now >= oracle && now !== 0) {
+      let confirmed = true
+      for (let r = 0; r < 2; r++) {
+        await w.jitter(4, 7)
+        const again = await countCards(w)
+        if (again > now) {
+          confirmed = false
+          stall = 0
+          last = again
+          break
+        }
+      }
+      if (confirmed) break
+    }
     if (stall >= stallRounds && now !== 0) {
       const atBottom = await w.page.evaluate(
         () => window.innerHeight + window.scrollY >= document.body.scrollHeight - 100
@@ -461,14 +488,12 @@ async function resetToHebei(w) {
   await waitIdle(w)
   await w.pullCaptures()
   // 选省会触发 getStandardlist（分省页签标准资费选项的附加条件）；慢出口下
-  // 稍等捕获到位（最多 ~40s），到位与否都继续（报告会显式暴露）
+  // 稍等捕获到位（最多 ~24s；后续还有周期拉取 + 枚举重试 + 标准资费分支复检三层兜底）
   if (!w.api.standardTables) {
-    w.log('等待 getStandardlist 明文捕获（标准资费选项的附加条件）...')
-    for (let i = 0; i < 10 && !w.api.standardTables; i++) {
+    for (let i = 0; i < 6 && !w.api.standardTables; i++) {
       await w.jitter(2.5, 4)
       await w.pullCaptures()
     }
-    w.log(`getStandardlist: ${w.api.standardTables ? '已捕获' : '未见（该省可能无标准资费或响应慢）'}`)
   }
 }
 
@@ -731,6 +756,55 @@ async function saveJson(w, cards, filename) {
   w.log(`saved: ${path} (${cards.length} cards)`)
 }
 
+/** 增量写齐全性报告 + beans 归档（每类型完成即落盘：超时中断也能留下证据链） */
+function writeIncrementalReport(w, results, done = false) {
+  const report = {
+    fetchedAt: new Date().toISOString(),
+    complete: done,
+    scope: '个人 × 河北分省',
+    capture: {
+      mechanism: 'JSON.parse 应用层明文捕获（isWX 通道解密必经点）+ XHR URL 关联',
+      endpoints: Object.fromEntries(w.api.endpoints),
+      otherCaptures: w.api.other,
+      initialType: '套餐',
+    },
+    types: results,
+    listByType: [...w.api.listByType.entries()].map(([label, e]) => ({
+      label,
+      total: e.total,
+      pages: e.pages,
+      maxPageNumber: e.maxPageNumber,
+      beanUnique: e.beans.size,
+      firstBeanKeys: e.firstBeanKeys,
+    })),
+    standardFromApi: !!w.api.standardTables,
+    standardGroups: w.api.standardTables
+      ? w.api.standardTables.map((t) => ({ title: t.title, rows: t.tBody.length }))
+      : null,
+  }
+  try {
+    writeFileSync(join(API_DUMP_DIR, 'api-report.json'), JSON.stringify(report, null, 2), 'utf-8')
+    for (const [label, e] of w.api.listByType) {
+      if (e.beans.size) {
+        writeFileSync(
+          join(API_DUMP_DIR, `beans-${fileSafe(label)}.json`),
+          JSON.stringify([...e.beans.values()], null, 1),
+          'utf-8'
+        )
+      }
+    }
+    if (w.api.standardTables) {
+      writeFileSync(
+        join(API_DUMP_DIR, 'standard-raw.json'),
+        JSON.stringify(w.api.standardTables, null, 2),
+        'utf-8'
+      )
+    }
+  } catch {
+    /* 报告写入失败不影响主流程 */
+  }
+}
+
 /**
  * 唯一阶段：个人资费 / 河北资费 × 全部类型
  * （动态枚举 + 应用层明文捕获齐全性校验）
@@ -843,7 +917,8 @@ async function phasePersonalHebei(w) {
       continue
     }
 
-    let count = await scrollAll(w)
+    const typeOracle = () => w.api.listByType.get(label)?.total ?? null
+    let count = await scrollAll(w, 220, typeOracle)
     await w.pullCaptures()
     let entry = w.api.listByType.get(label)
     // 接口已声明 0 条的空类型无需重试；其余 0 cards 场景冷却 60~90s 重选重抓一次
@@ -852,86 +927,65 @@ async function phasePersonalHebei(w) {
       await w.jitter(60, 90)
       await selectType(w, label)
       await waitIdle(w)
-      count = await scrollAll(w)
+      count = await scrollAll(w, 220, typeOracle)
       await w.pullCaptures()
       entry = w.api.listByType.get(label)
     }
     let cards = count > 0 ? await extractCards(w) : null
-    /** 唯一方案编号数（生产实测：懒加载翻页风暴会产生重复卡片——DOM 节点数
-     *  会超过接口 total（如 702>666），唯一编号数才是真实的齐全性度量） */
+    /** 唯一方案编号数（生产实测 DOM 节点数与唯一编号数一致，无重复卡片） */
     const uniqueCount = (cs) => {
       if (!cs) return 0
       const codes = cs.map((c) => c.fields?.['方案编号']).filter(Boolean)
       return codes.length ? new Set(codes).size : cs.length
     }
     let unique = uniqueCount(cards)
-    // 接口齐全性自愈：唯一编号数 < 捕获 total → 追加一轮滚动（在途批次/翻页重复兜底）
+    // 接口齐全性自愈：唯一编号数 < 捕获 total → 追加一轮滚动（在途批次/翻页缺失兜底）
     let apiTotal = entry ? entry.total : null
     if (apiTotal != null && unique < apiTotal && !(entry && entry.total === 0)) {
       w.log(`${label}: 唯一 ${unique} < 明文 total ${apiTotal}——追加一轮滚动自愈`)
-      count = await scrollAll(w)
+      count = await scrollAll(w, 220, typeOracle)
       await w.pullCaptures()
       entry = w.api.listByType.get(label)
       apiTotal = entry ? entry.total : null
       cards = count > 0 ? await extractCards(w) : cards
       unique = uniqueCount(cards)
     }
+    // 诊断：DOM 卡片编号 vs 捕获 beans id/tariffSeqno 交叉对照（生产数据源一致性审计）
+    let beanCross = ''
+    if (entry && cards) {
+      const beanIds = new Set()
+      for (const b of entry.beans.values()) {
+        if (b && typeof b === 'object') {
+          if (b.id != null) beanIds.add(String(b.id))
+          if (b.tariffSeqno != null) beanIds.add(String(b.tariffSeqno))
+        }
+      }
+      const domCodes = new Set(cards.map((c) => c.fields?.['方案编号']).filter(Boolean))
+      if (beanIds.size && domCodes.size) {
+        let domOnly = 0
+        let beanOnly = 0
+        for (const c of domCodes) if (!beanIds.has(c)) domOnly++
+        for (const b of beanIds) if (!domCodes.has(b)) beanOnly++
+        beanCross = `，DOM独有 ${domOnly}/beans独有 ${beanOnly}`
+      }
+    }
     w.log(
-      `${label}: DOM ${count} cards / 唯一编号 ${unique}（明文 total=${apiTotal ?? '未知'}，beans=${entry ? entry.beans.size : '—'}，firstBeanKeys=${entry?.firstBeanKeys ? entry.firstBeanKeys.slice(0, 8).join(',') : '—'}）`
+      `${label}: DOM ${count} / 唯一 ${unique}（total=${apiTotal ?? '未知'}，beans=${entry ? entry.beans.size : '—'}${beanCross}）`
     )
     if (cards) {
       for (const c of cards) c._sourceType = label
       await saveJson(w, cards, `p_h_${fileSafe(label)}.json`)
     }
     results.push({ label, count: unique, domCount: count, apiTotal, note: '' })
-    await w.jitter(3, 6) // 类型之间的浏览间歇
+    writeIncrementalReport(w, results) // 超时中断也能留下已采类型的报告
+    await w.jitter(2, 4) // 类型之间的浏览间歇
   }
 
   w.stopPuller()
   await w.pullCaptures()
 
   /* ---------- 应用层捕获齐全性报告（严格门禁，阻断推送） ---------- */
-  const report = {
-    fetchedAt: new Date().toISOString(),
-    scope: '个人 × 河北分省',
-    capture: {
-      mechanism: 'JSON.parse 应用层明文捕获（isWX 通道解密必经点）+ XHR URL 关联',
-      endpoints: Object.fromEntries(w.api.endpoints),
-      otherCaptures: w.api.other,
-      initialType: '套餐',
-    },
-    types: results,
-    listByType: [...w.api.listByType.entries()].map(([label, e]) => ({
-      label,
-      total: e.total,
-      pages: e.pages,
-      maxPageNumber: e.maxPageNumber,
-      beanUnique: e.beans.size,
-      firstBeanKeys: e.firstBeanKeys,
-    })),
-    standardFromApi: !!w.api.standardTables,
-    standardGroups: w.api.standardTables
-      ? w.api.standardTables.map((t) => ({ title: t.title, rows: t.tBody.length }))
-      : null,
-  }
-  writeFileSync(join(API_DUMP_DIR, 'api-report.json'), JSON.stringify(report, null, 2), 'utf-8')
-  // beans 原始数据归档（未来切换「接口直连数据源」的分析素材）
-  for (const [label, e] of w.api.listByType) {
-    if (e.beans.size) {
-      writeFileSync(
-        join(API_DUMP_DIR, `beans-${fileSafe(label)}.json`),
-        JSON.stringify([...e.beans.values()], null, 1),
-        'utf-8'
-      )
-    }
-  }
-  if (w.api.standardTables) {
-    writeFileSync(
-      join(API_DUMP_DIR, 'standard-raw.json'),
-      JSON.stringify(w.api.standardTables, null, 2),
-      'utf-8'
-    )
-  }
+  writeIncrementalReport(w, results, true) // 最终版（complete=true；beans/标准资费归档同函数内）
 
   tlog('── 应用层捕获齐全性报告 ──')
   tlog(
