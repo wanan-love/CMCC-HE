@@ -101,7 +101,9 @@ class WhereBuilder {
 
 /* ---------- 高级筛选（与 src/lib/adv-filter.ts 同构） ---------- */
 
-const FILTER_CATEGORIES = ['套餐', '加装包', '营销活动', '港澳台/国际资费', '港澳台国际']
+// 与 src/lib/adv-filter.ts / types.ts ALL_CATEGORIES 保持一致（Task 18 新增 3 类；
+// 漂移曾致 category=标准资费 被静默丢弃返回全量）
+const FILTER_CATEGORIES = ['套餐', '加装包', '营销活动', '港澳台/国际资费', '标准资费', '国际及港澳台标准资费', '其他', '港澳台国际']
 const NONE_SENTINEL = '__none__'
 
 interface AdvFilters {
@@ -746,7 +748,7 @@ async function handleInsights(env: Env) {
     env.DB.prepare(
       `SELECT substr(date, 1, 7) AS m, category, COUNT(*) AS c FROM ChangeEvent
        WHERE date >= ? AND type = 'ADDED' AND source != 'demo'
-         AND category IN ('套餐', '加装包', '营销活动', '港澳台/国际资费')
+         AND category IN ('套餐', '加装包', '营销活动', '港澳台/国际资费', '标准资费', '国际及港澳台标准资费', '其他')
        GROUP BY m, category ORDER BY m`
     )
       .bind(since24mStr)
@@ -796,10 +798,11 @@ async function handleInsights(env: Env) {
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([m, v]) => ({ month: m, ...v }))
 
-  // 24 个月新上线分类构成（每月四分类齐全 —— 与沙箱版对象形状一致）
+  // 24 个月新上线分类构成（每月全分类列齐全 —— 与沙箱版对象形状一致，含 Task 18 新增 3 类）
   const catByMonth: Record<string, Record<string, number>> = {}
   for (const r of catMonthlyRaw.results) {
-    if (!catByMonth[r.m]) catByMonth[r.m] = { 套餐: 0, 加装包: 0, 营销活动: 0, '港澳台/国际资费': 0 }
+    if (!catByMonth[r.m])
+      catByMonth[r.m] = { 套餐: 0, 加装包: 0, 营销活动: 0, '港澳台/国际资费': 0, 标准资费: 0, 国际及港澳台标准资费: 0, 其他: 0 }
     catByMonth[r.m][r.category] = (catByMonth[r.m][r.category] || 0) + r.c
   }
   const categoryMonthly = Object.entries(catByMonth)
@@ -1037,7 +1040,8 @@ async function exportTariffsCsv(env: Env, sp: URLSearchParams) {
 
 /* ---------- 订阅源 ---------- */
 
-const VALID_CATEGORIES = ['套餐', '加装包', '营销活动', '港澳台/国际资费']
+// 与 src/app/api/feed/route.ts 的 [...ALL_CATEGORIES] 对齐（含 Task 18 新增 3 类）
+const VALID_CATEGORIES = ['套餐', '加装包', '营销活动', '港澳台/国际资费', '标准资费', '国际及港澳台标准资费', '其他']
 const TYPE_PREFIX: Record<string, string> = { ADDED: '🟢 上线', REMOVED: '🔴 下线', UPDATED: '🟡 变更' }
 
 const escXml = (s: string) =>
