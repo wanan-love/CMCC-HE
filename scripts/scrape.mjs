@@ -17,9 +17,10 @@
  *   1) 列表分页 POST /website/nrapigate/nrtariff/new/Tariff/getTariffListInfo
  *      body {province:'311', isPublic:'1', tariffAttr:'2'分省, type1:'1'个人,
  *            type2:'1'~'7', page, limit:5}
- *   2) 标准资费 POST .../getStandardlist {province, isPublic} → rspBody 为
- *      数组或 {tariffList:[...]}，每组 {tariffTable:{tHead,tBody}}——
- *      官方页面只用 tariffList[0]（首组表格），本脚本提取【全部组】
+ *   2) 标准资费（生产实证 2026-09-04 run15）：河北页面实际走 getTariffListInfo
+ *      type2=5 的普通分页列表（渲染标准卡片、带真实方案编号）；getStandardlist
+ *      {province,isPublic} 表格接口（rspBody 数组或 {tariffList:[...]}，每组
+ *      {tariffTable:{tHead,tBody}}）为遗留路径，仅当列表 0 卡片时兜底提取全部组
  *   3) 类型可用性 POST .../getType2List
  *   4) 类型值映射（chunk-155 硬编码）：1套餐/2加装包/3营销活动/4港澳台国际/
  *      5标准资费(特殊值，仅分省页签且数据存在时出现)6国际及港澳台标准/7其他
@@ -906,50 +907,6 @@ async function phasePersonalHebei(w) {
     if (done.has(label)) continue
     done.add(label)
 
-    /* ---- 标准资费：不走列表 API，数据源 = 捕获明文（全部表格组） ---- */
-    if (label === '标准资费') {
-      await selectType(w, label)
-      await w.jitter(5, 9)
-      await w.pullCaptures()
-      let items = w.api.standardTables ? standardTablesToItems(w.api.standardTables) : null
-      let note = w.api.standardTables ? `明文 ${w.api.standardTables.length} 表格组` : ''
-      if (!items || items.length === 0) {
-        // 兜底 1：DOM vxe-table
-        const domItems = await standardItemsFromDom(w)
-        if (domItems.length) {
-          items = domItems
-          note = `DOM 兜底 ${domItems.length} 行`
-        } else {
-          // 兜底 2：再等一轮捕获（慢出口）
-          for (let i = 0; i < 6 && !w.api.standardTables; i++) {
-            await w.jitter(3, 5)
-            await w.pullCaptures()
-          }
-          items = w.api.standardTables ? standardTablesToItems(w.api.standardTables) : null
-          if (items && items.length) note = `慢捕获 ${w.api.standardTables.length} 表格组`
-        }
-      }
-      if (items && items.length) {
-        await saveJson(w, items, `p_h_${fileSafe(label)}.json`)
-        results.push({ label, count: items.length, apiTotal: items.length, note })
-      } else {
-        // 选项存在却拿不到数据：dump 现场（未分类捕获摘要 + 标准视图 DOM 片段）供离线分析，
-        // 然后判失败（宁缺毋滥）
-        try {
-          const domHtml = await w.page.evaluate(() => {
-            const box = document.querySelector('.free-cont-box, .freeContent-table, .StandarTariff')
-            const root = box || document.querySelector('#app') || document.body
-            return (root.innerHTML || '').slice(0, 3000)
-          })
-          writeFileSync(join(API_DUMP_DIR, 'standard-dom.html'), domHtml, 'utf-8')
-          w.log('标准资费现场已 dump（seed/api/standard-dom.html）')
-        } catch {}
-        results.push({ label, count: 0, apiTotal: null, note: '选项存在但明文/DOM 均未取到数据' })
-      }
-      await w.jitter(3, 6)
-      continue
-    }
-
     /* ---- 常规列表类型 ---- */
     // 已选中类型不重复点击（同值选择不触发重载，滚动收集现有列表即可）
     const already = (await readSelectedType(w)) || ''
@@ -978,6 +935,19 @@ async function phasePersonalHebei(w) {
       count = await scrollAll(w, 220, typeOracle)
       await w.pullCaptures()
       entry = w.api.listByType.get(label)
+    }
+    /* ---- 标准资费：v4.5 并入普通列表流（生产实证：河北页面该类型走 getTariffListInfo
+       type2=5 分页列表，渲染 .tariff-item-container 卡片且带真实方案编号；旧模板分析的
+       vxe-table 特殊表格视图仅作 0 卡片时的兜底。兜底判定须在【本类型】列表流（含
+       0 卡重试）之后——循环顶 countCards 看到的是上一类型的残留卡片，恒非本类型状态） ---- */
+    if (label === '标准资费' && count === 0 && w.api.standardTables) {
+      const items = standardTablesToItems(w.api.standardTables)
+      if (items.length) {
+        await saveJson(w, items, `p_h_${fileSafe(label)}.json`)
+        results.push({ label, count: items.length, apiTotal: items.length, note: '表格兜底（列表 0 卡片）' })
+        await w.jitter(2, 4)
+        continue
+      }
     }
     let cards = count > 0 ? await extractCards(w) : null
     /** 唯一方案编号数（生产实测 DOM 节点数与唯一编号数一致，无重复卡片） */
